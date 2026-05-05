@@ -1,35 +1,36 @@
-# ════════════════════════════════════════════════════════════════
-# CHUNK 1 of 5  —  paste into a NEW empty file called main.py
-#                  then paste chunks 2-5 immediately after
-# ════════════════════════════════════════════════════════════════
 import uuid
 import json
-import os
-from datetime import datetime, date, timedelta
-from typing import Optional, List
+import csv
+import io
+from datetime import datetime, date
+from typing import Optional
 from pathlib import Path
 
 from fastapi import FastAPI, Request, Form, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 import aiofiles
 
-# ── paths ───────────────────────────────────────────────────────
+# ── paths ────────────────────────────────────────────────────────
 BASE_DIR    = Path(__file__).parent
 DATA_DIR    = BASE_DIR / "data"
 PICKUPS_F   = DATA_DIR / "pickups.json"
 CUSTOMERS_F = DATA_DIR / "customers.json"
 PROFILE_F   = DATA_DIR / "profile.json"
+EXPENSES_F  = DATA_DIR / "expenses.json"
+SHIFTS_F    = DATA_DIR / "shifts.json"
 
 DATA_DIR.mkdir(exist_ok=True)
 (BASE_DIR / "static" / "css").mkdir(parents=True, exist_ok=True)
 (BASE_DIR / "static" / "js").mkdir(parents=True, exist_ok=True)
 (BASE_DIR / "templates").mkdir(exist_ok=True)
 
-# ── embedded HTML templates ─────────────────────────────────────
-BASE_HTML = """\
-<!DOCTYPE html>
+# ════════════════════════════════════════════════════════════════
+# HTML TEMPLATES
+# ════════════════════════════════════════════════════════════════
+
+BASE_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -52,6 +53,8 @@ BASE_HTML = """\
     {% if profile %}
     <nav class="site-nav">
       <a href="/" class="nav-link {% if request.url.path == '/' %}active{% endif %}">📋 Log</a>
+      <a href="#" onclick="openShiftModal()" class="nav-link">⏱ Shift</a>
+      <a href="#" onclick="openExpenseModal()" class="nav-link">💸 Expenses</a>
       <a href="#" onclick="openModal('reportModal')" class="nav-link">📊 Report</a>
       <a href="#" onclick="openModal('backupModal')" class="nav-link">💾 Backup</a>
       <a href="/setup" class="nav-link {% if request.url.path == '/setup' %}active{% endif %}">⚙️ Setup</a>
@@ -61,23 +64,31 @@ BASE_HTML = """\
 </header>
 <main class="site-main">{% block content %}{% endblock %}</main>
 
+<!-- Report Modal -->
 <div id="reportModal" class="modal-overlay" style="display:none">
   <div class="modal-box modal-wide">
     <div class="modal-header">
-      <h2>📊 Daily Report</h2>
+      <h2>📊 Earnings Report</h2>
       <button class="modal-close" onclick="closeModal('reportModal')">✕</button>
     </div>
     <div class="modal-body">
-      <div class="row-2 mb-4">
-        <div class="field-group"><label class="field-label">From Date</label><input type="date" id="rptFrom" class="field-input"></div>
-        <div class="field-group"><label class="field-label">To Date</label><input type="date" id="rptTo" class="field-input"></div>
+      <div class="report-controls mb-4">
+        <div class="row-2">
+          <div class="field-group"><label class="field-label">From Date</label><input type="date" id="rptFrom" class="field-input"></div>
+          <div class="field-group"><label class="field-label">To Date</label><input type="date" id="rptTo" class="field-input"></div>
+        </div>
+        <div class="btn-group mt-2">
+          <button class="btn btn-primary" onclick="generateReport()">Generate Report</button>
+          <button class="btn btn-secondary btn-sm" onclick="downloadReportCSV()">⬇ CSV Export</button>
+          <button class="btn btn-secondary btn-sm" onclick="downloadReportPDF()">⬇ PDF Report</button>
+        </div>
       </div>
-      <button class="btn btn-primary" onclick="generateReport()">Generate Report</button>
       <div id="reportOutput" class="report-output mt-4"></div>
     </div>
   </div>
 </div>
 
+<!-- Backup Modal -->
 <div id="backupModal" class="modal-overlay" style="display:none">
   <div class="modal-box">
     <div class="modal-header">
@@ -87,15 +98,19 @@ BASE_HTML = """\
     <div class="modal-body">
       <div class="section-label">Download Backup</div>
       <div class="btn-group mb-4">
-        <a href="/api/backup/pickups" class="btn btn-secondary btn-sm" download>⬇ Pickups</a>
+        <a href="/api/backup/pickups"   class="btn btn-secondary btn-sm" download>⬇ Pickups</a>
         <a href="/api/backup/customers" class="btn btn-secondary btn-sm" download>⬇ Customers</a>
-        <a href="/api/backup/profile" class="btn btn-secondary btn-sm" download>⬇ Profile</a>
+        <a href="/api/backup/expenses"  class="btn btn-secondary btn-sm" download>⬇ Expenses</a>
+        <a href="/api/backup/shifts"    class="btn btn-secondary btn-sm" download>⬇ Shifts</a>
+        <a href="/api/backup/profile"   class="btn btn-secondary btn-sm" download>⬇ Profile</a>
         <a href="/api/requirements-pdf" class="btn btn-secondary btn-sm" download>⬇ Requirements PDF</a>
       </div>
       <div class="section-label">Restore from Backup</div>
       <div class="warning-text">⚠️ Restore overwrites existing data and cannot be undone.</div>
       <div class="restore-row"><span class="restore-label">Pickups</span><input type="file" id="restorePickups" accept=".json"><button class="btn btn-sm btn-warning" onclick="restoreFile('pickups')">Restore</button></div>
       <div class="restore-row"><span class="restore-label">Customers</span><input type="file" id="restoreCustomers" accept=".json"><button class="btn btn-sm btn-warning" onclick="restoreFile('customers')">Restore</button></div>
+      <div class="restore-row"><span class="restore-label">Expenses</span><input type="file" id="restoreExpenses" accept=".json"><button class="btn btn-sm btn-warning" onclick="restoreFile('expenses')">Restore</button></div>
+      <div class="restore-row"><span class="restore-label">Shifts</span><input type="file" id="restoreShifts" accept=".json"><button class="btn btn-sm btn-warning" onclick="restoreFile('shifts')">Restore</button></div>
       <div class="restore-row"><span class="restore-label">Profile</span><input type="file" id="restoreProfile" accept=".json"><button class="btn btn-sm btn-warning" onclick="restoreFile('profile')">Restore</button></div>
       <hr class="divider">
       <div class="section-label danger-label">Danger Zone</div>
@@ -104,6 +119,7 @@ BASE_HTML = """\
   </div>
 </div>
 
+<!-- Edit Pickup Modal -->
 <div id="editModal" class="modal-overlay" style="display:none">
   <div class="modal-box modal-wide">
     <div class="modal-header">
@@ -114,18 +130,105 @@ BASE_HTML = """\
   </div>
 </div>
 
+<!-- Expense Modal -->
+<div id="expenseModal" class="modal-overlay" style="display:none">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2>💸 Daily Expenses</h2>
+      <button class="modal-close" onclick="closeModal('expenseModal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <form id="expenseForm" onsubmit="submitExpense(event)">
+        <div class="row-2">
+          <div class="field-group">
+            <label class="field-label">Date <span class="required">*</span></label>
+            <input type="date" id="exp_date" class="field-input" required onchange="loadExpenses()">
+          </div>
+          <div class="field-group">
+            <label class="field-label">Amount ($) <span class="required">*</span></label>
+            <input type="number" id="exp_amount" class="field-input" step="0.01" min="0" required placeholder="0.00">
+          </div>
+        </div>
+        <div class="field-group">
+          <label class="field-label">Category <span class="required">*</span></label>
+          <select id="exp_category" class="field-input" required>
+            <option value="">— Select —</option>
+            <option>Gate Fee</option><option>Fuel</option><option>Tolls</option>
+            <option>Maintenance</option><option>Car Wash</option>
+            <option>Insurance</option><option>Phone</option><option>Other</option>
+          </select>
+        </div>
+        <div class="field-group">
+          <label class="field-label">Notes</label>
+          <input type="text" id="exp_notes" class="field-input" placeholder="Optional">
+        </div>
+        <button type="submit" class="btn btn-primary btn-full">Add Expense</button>
+      </form>
+      <div id="expenseList" class="expense-list mt-4"></div>
+      <div id="expenseTotalBar" class="expense-total-bar" style="display:none">
+        <span class="expense-total-label">Day Total Expenses</span>
+        <span id="expenseTotalVal" class="expense-total-val">$0.00</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Shift Modal -->
+<div id="shiftModal" class="modal-overlay" style="display:none">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2>⏱ Shift Log</h2>
+      <button class="modal-close" onclick="closeModal('shiftModal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <form id="shiftForm" onsubmit="submitShift(event)">
+        <div class="field-group">
+          <label class="field-label">Date <span class="required">*</span></label>
+          <input type="date" id="sh_date" class="field-input" required onchange="loadShift()">
+        </div>
+        <div class="row-2">
+          <div class="field-group">
+            <label class="field-label">Start Time</label>
+            <input type="time" id="sh_start" class="field-input" oninput="calcShiftStats()">
+          </div>
+          <div class="field-group">
+            <label class="field-label">End Time</label>
+            <input type="time" id="sh_end" class="field-input" oninput="calcShiftStats()">
+          </div>
+        </div>
+        <div class="row-2">
+          <div class="field-group">
+            <label class="field-label">Odometer Start</label>
+            <input type="number" id="sh_odo_start" class="field-input" step="1" min="0" placeholder="Miles" oninput="calcShiftStats()">
+          </div>
+          <div class="field-group">
+            <label class="field-label">Odometer End</label>
+            <input type="number" id="sh_odo_end" class="field-input" step="1" min="0" placeholder="Miles" oninput="calcShiftStats()">
+          </div>
+        </div>
+        <div id="shiftStatsBar" class="shift-stats-bar" style="display:none">
+          <div class="shift-stat"><div class="shift-stat-label">Miles Driven</div><div class="shift-stat-val" id="shiftMilesVal">0</div></div>
+          <div class="shift-stat"><div class="shift-stat-label">Hours on Shift</div><div class="shift-stat-val" id="shiftHoursVal">0</div></div>
+        </div>
+        <div class="field-group">
+          <label class="field-label">Notes</label>
+          <input type="text" id="sh_notes" class="field-input" placeholder="Optional">
+        </div>
+        <button type="submit" class="btn btn-primary btn-full">Save Shift</button>
+      </form>
+      <div id="shiftSaved" class="shift-saved mt-4" style="display:none"></div>
+    </div>
+  </div>
+</div>
+
 <div id="toast" class="toast" style="display:none"></div>
 <script src="/static/js/app.js"></script>
 {% block extra_js %}{% endblock %}
 </body>
 </html>
 """
-# ════════════════════════════════════════════════════════════════
-# CHUNK 2 of 5  —  paste immediately after chunk 1
-# ════════════════════════════════════════════════════════════════
 
-INDEX_HTML = """\
-{% extends "base.html" %}
+INDEX_HTML = """{% extends "base.html" %}
 {% block title %}Daily Log – Taxi Log{% endblock %}
 {% block content %}
 <div class="page-layout">
@@ -225,7 +328,7 @@ INDEX_HTML = """\
         <div class="totals-head"><div class="totals-head-label">Daily Totals</div></div>
         <div class="totals-grid" id="totalsGrid"></div>
         <div class="owed-driver-bar">
-          <span class="owed-driver-label">Owed Driver</span>
+          <span class="owed-driver-label" id="owedDriverLabel">Owed Driver</span>
           <span class="owed-driver-val" id="owedDriverVal">$0.00</span>
         </div>
       </div>
@@ -246,8 +349,7 @@ INDEX_HTML = """\
 {% endblock %}
 """
 
-SETUP_HTML = """\
-{% extends "base.html" %}
+SETUP_HTML = """{% extends "base.html" %}
 {% block title %}Setup – Taxi Log{% endblock %}
 {% block content %}
 <div class="setup-page">
@@ -271,14 +373,63 @@ SETUP_HTML = """\
         <input type="tel" name="phone" class="field-input"
                value="{{ profile.phone if profile else '' }}" placeholder="(555) 555-5555">
       </div>
+
+      <hr class="divider">
+      <div class="setup-section-title">💰 Payment Settings</div>
+      <div class="setup-section-sub">Controls how "Owed Driver" is calculated on the daily log and reports.</div>
+
+      <div class="field-group">
+        <label class="field-label">Payment Mode</label>
+        <select name="pay_mode" id="pay_mode_sel" class="field-input" onchange="togglePayFields()">
+          <option value="standard"   {% if not profile or profile.get('pay_mode','standard')=='standard'   %}selected{% endif %}>Standard (split formula)</option>
+          <option value="gate"       {% if profile and profile.get('pay_mode')=='gate'       %}selected{% endif %}>Flat Daily Gate Fee</option>
+          <option value="commission" {% if profile and profile.get('pay_mode')=='commission' %}selected{% endif %}>Meter Commission Split</option>
+          <option value="owner"      {% if profile and profile.get('pay_mode')=='owner'      %}selected{% endif %}>Owner-Operator (keep all)</option>
+        </select>
+      </div>
+
+      <div id="gateField" class="field-group" style="display:none">
+        <label class="field-label">Daily Gate Fee ($)</label>
+        <input type="number" name="gate_fee" class="field-input" step="0.01" min="0"
+               value="{{ profile.gate_fee if profile and profile.gate_fee else '' }}" placeholder="120.00">
+        <div class="field-hint">Amount you pay the company each shift</div>
+      </div>
+
+      <div id="commField" class="field-group" style="display:none">
+        <label class="field-label">Company % of Meter</label>
+        <input type="number" name="company_pct" class="field-input" step="0.1" min="0" max="100"
+               value="{{ profile.company_pct if profile and profile.company_pct else '' }}" placeholder="50">
+        <div class="field-hint">Company keeps this % of meter fares. You keep 100% of tips.</div>
+      </div>
+
+      <div id="payModeExplain" class="pay-mode-explain"></div>
+
       <button type="submit" class="btn btn-primary btn-full mt-4">Save Profile &amp; Continue →</button>
     </form>
   </div>
 </div>
 {% endblock %}
+{% block extra_js %}
+<script>
+const _explains = {
+  standard:   'Formula: ((Credit Meter + Voucher Meter) − Cash Meter) ÷ 2 + Credit Tips + Voucher Tips',
+  gate:       'Formula: Grand Total − Daily Gate Fee',
+  commission: 'Formula: Meter Total × Driver% + All Tips  (you keep everything above the company cut)',
+  owner:      'You keep 100% of all fares and tips. Track your own expenses separately.'
+};
+function togglePayFields(){
+  const mode = document.getElementById('pay_mode_sel').value;
+  document.getElementById('gateField').style.display   = mode === 'gate'       ? '' : 'none';
+  document.getElementById('commField').style.display   = mode === 'commission' ? '' : 'none';
+  document.getElementById('payModeExplain').textContent = _explains[mode] || '';
+}
+togglePayFields();
+</script>
+{% endblock %}
 """
+
 # ════════════════════════════════════════════════════════════════
-# CHUNK 3 of 5  —  paste immediately after chunk 2
+# CSS
 # ════════════════════════════════════════════════════════════════
 
 CSS = """\
@@ -320,6 +471,7 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:14
 .panel-body{padding:20px}
 .field-group{display:flex;flex-direction:column;gap:5px;margin-bottom:14px}
 .field-label{font-size:11.5px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.06em}
+.field-hint{font-size:11px;color:var(--text3);margin-top:2px}
 .required{color:var(--amber-d);margin-left:2px}
 .field-input{border:1.5px solid var(--border);border-radius:var(--radius-sm);padding:9px 11px;font-size:14px;color:var(--text);background:var(--surface);transition:border-color .15s,box-shadow .15s;width:100%;font-family:var(--font)}
 .field-input:hover{border-color:var(--border2)}
@@ -384,21 +536,25 @@ select.field-input{cursor:pointer}
 .owed-driver-val{font-size:26px;font-weight:800;color:#fff;letter-spacing:-.5px}
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:500;display:flex;align-items:center;justify-content:center;padding:20px}
 .modal-box{background:var(--surface);border-radius:var(--radius-lg);box-shadow:var(--shadow-lg);width:100%;max-width:520px;max-height:90vh;overflow-y:auto;border:1px solid var(--border)}
-.modal-wide{max-width:860px}
+.modal-wide{max-width:900px}
 .modal-header{display:flex;justify-content:space-between;align-items:center;padding:18px 22px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--surface);z-index:1}
 .modal-header h2{font-size:16px;font-weight:700}
 .modal-close{background:var(--surface2);border:none;cursor:pointer;width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:14px;color:var(--text2);transition:all .15s}
 .modal-close:hover{background:var(--border);color:var(--text)}
 .modal-body{padding:22px}
+.report-controls{border-bottom:1px solid var(--border);padding-bottom:16px}
 .report-output{font-size:13px}
 .report-day{margin-bottom:20px;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
 .report-day-hdr{background:var(--text);color:#fff;padding:10px 14px;display:flex;justify-content:space-between;align-items:center}
+.report-shift-bar{background:#2D2A26;color:rgba(255,255,255,.6);font-size:11px;padding:5px 14px}
 .report-table{width:100%;border-collapse:collapse}
 .report-table th{background:var(--amber-lt);padding:8px 12px;text-align:left;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--amber-dd);border-bottom:1px solid var(--border)}
 .report-table td{padding:8px 12px;border-bottom:1px solid var(--border);font-size:13px}
 .report-table tr:last-child td{border-bottom:none}
 .report-table tr:hover td{background:var(--surface2)}
+.report-expense-row td{background:var(--red-lt);color:#991B1B;font-style:italic}
 .report-day-foot{background:var(--surface2);padding:10px 14px;display:flex;flex-wrap:wrap;gap:14px;font-size:12px;border-top:1px solid var(--border)}
+.report-net{color:var(--green);font-weight:700}
 .report-summary{background:var(--text);color:#fff;border-radius:var(--radius);padding:18px;margin-top:16px}
 .report-summary h3{color:var(--amber);margin-bottom:14px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.07em}
 .summary-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px}
@@ -406,6 +562,7 @@ select.field-input{cursor:pointer}
 .summary-label{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:rgba(255,255,255,.4);margin-bottom:3px}
 .summary-val{font-size:17px;font-weight:700;color:#fff;letter-spacing:-.3px}
 .summary-owed{color:var(--amber)}
+.summary-net{color:#34D399}
 .restore-row{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)}
 .restore-row:last-child{border-bottom:none}
 .restore-label{width:80px;font-size:13px;font-weight:600;color:var(--text2);flex-shrink:0}
@@ -417,19 +574,558 @@ select.field-input{cursor:pointer}
 .mt-2{margin-top:8px}.mt-4{margin-top:16px}.mb-4{margin-bottom:16px}
 .toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:var(--text);color:#fff;padding:11px 22px;border-radius:var(--radius-xl);font-size:13.5px;font-weight:600;box-shadow:var(--shadow-lg);z-index:9999;pointer-events:none;letter-spacing:-.1px}
 .setup-page{display:flex;align-items:center;justify-content:center;min-height:calc(100vh - 60px);padding:40px 20px}
-.setup-card{background:var(--surface);border-radius:var(--radius-xl);box-shadow:var(--shadow-lg);padding:40px;width:100%;max-width:440px;border:1px solid var(--border)}
+.setup-card{background:var(--surface);border-radius:var(--radius-xl);box-shadow:var(--shadow-lg);padding:40px;width:100%;max-width:480px;border:1px solid var(--border)}
 .setup-icon{font-size:44px;text-align:center;margin-bottom:16px}
 .setup-title{font-size:24px;font-weight:800;text-align:center;color:var(--text);margin-bottom:4px;letter-spacing:-.5px}
 .setup-sub{text-align:center;color:var(--text3);margin-bottom:28px;font-size:14px}
 .setup-form .field-group{margin-bottom:16px}
+.setup-section-title{font-size:14px;font-weight:700;color:var(--text);margin-bottom:4px}
+.setup-section-sub{font-size:12px;color:var(--text3);margin-bottom:16px}
+.pay-mode-explain{font-size:12px;color:var(--text2);background:var(--surface2);border-radius:var(--radius-sm);padding:8px 10px;margin-top:4px;border:1px solid var(--border);min-height:36px;font-style:italic}
+.expense-list{display:flex;flex-direction:column;gap:6px}
+.expense-item{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:var(--surface2);border-radius:var(--radius-sm);border:1px solid var(--border)}
+.expense-item-left{display:flex;flex-direction:column;gap:2px}
+.expense-item-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.expense-cat-badge{font-size:11px;font-weight:700;padding:2px 8px;border-radius:20px;background:var(--red-lt);color:#991B1B}
+.expense-notes{font-size:11px;color:var(--text3)}
+.expense-amt{font-size:15px;font-weight:700;color:var(--red)}
+.expense-total-bar{display:flex;justify-content:space-between;align-items:center;padding:12px 14px;background:var(--red-lt);border-radius:var(--radius-sm);margin-top:12px;border:1px solid #FECACA}
+.expense-total-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#991B1B}
+.expense-total-val{font-size:20px;font-weight:800;color:var(--red)}
+.shift-stats-bar{display:flex;gap:12px;background:var(--amber-xl);border-radius:var(--radius-sm);padding:12px 14px;margin:12px 0;border:1px solid var(--amber-lt)}
+.shift-stat{flex:1;text-align:center}
+.shift-stat-label{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--amber-dd);font-weight:600;margin-bottom:2px}
+.shift-stat-val{font-size:22px;font-weight:800;color:var(--amber-dd)}
+.shift-saved{background:var(--surface2);border-radius:var(--radius);border:1px solid var(--border);overflow:hidden}
+.shift-saved-row{display:flex;justify-content:space-between;padding:8px 14px;border-bottom:1px solid var(--border);font-size:13px}
+.shift-saved-row:last-child{border-bottom:none}
+.shift-saved-row span{color:var(--text3)}
+.shift-saved-row strong{color:var(--text)}
 """
+
 # ════════════════════════════════════════════════════════════════
-# CHUNK 4 of 5  —  paste immediately after chunk 3
+# JAVASCRIPT
 # ════════════════════════════════════════════════════════════════
 
-JS = '/* app.js */\nfunction fmt(v){return\'$\'+(parseFloat(v)||0).toFixed(2)}\n\nfunction showToast(msg,d=2500){\n  const t=document.getElementById(\'toast\');\n  t.textContent=msg;t.style.display=\'block\';\n  clearTimeout(t._t);t._t=setTimeout(()=>t.style.display=\'none\',d);\n}\nfunction openModal(id){document.getElementById(id).style.display=\'flex\'}\nfunction closeModal(id){document.getElementById(id).style.display=\'none\'}\ndocument.querySelectorAll(\'.modal-overlay\').forEach(el=>{\n  el.addEventListener(\'click\',e=>{if(e.target===el)el.style.display=\'none\'});\n});\n\nfunction updateCalcTotal(){\n  const m=parseFloat(document.getElementById(\'meter_total\')?.value)||0;\n  const t=parseFloat(document.getElementById(\'tip\')?.value)||0;\n  const el=document.getElementById(\'calcTotal\');\n  if(el)el.textContent=fmt(m+t);\n}\n\n/* --- Autocomplete --- */\nlet acTimer=null;\nfunction suggestCustomers(input,field){\n  clearTimeout(acTimer);\n  const q=input.value.trim();\n  const listId=field===\'phone\'?\'ac-phone\':field===\'address\'?\'ac-address\':\'ac-name\';\n  if(q.length<2){clearAC();return}\n  acTimer=setTimeout(async()=>{\n    const r=await fetch(\'/api/customers/suggest?q=\'+encodeURIComponent(q));\n    renderAC(listId,await r.json());\n  },200);\n}\nfunction renderAC(listId,customers){\n  clearAC();\n  if(!customers.length)return;\n  const list=document.getElementById(listId);\n  customers.forEach(c=>{\n    const d=document.createElement(\'div\');\n    d.className=\'ac-item\';\n    d.innerHTML=\'<div class="ac-name">\'+(c.name||\'—\')+\'</div>\'\n      +\'<div class="ac-detail">\'+(c.street_address||\'\')+\' \'+(c.city||\'\')+(c.phone?\' · \'+c.phone:\'\')+\'</div>\';\n    d.onclick=()=>{fillFromCustomer(c);clearAC()};\n    list.appendChild(d);\n  });\n}\nfunction clearAC(){\n  [\'ac-phone\',\'ac-address\',\'ac-name\'].forEach(id=>{\n    const el=document.getElementById(id);if(el)el.innerHTML=\'\';\n  });\n}\nfunction fillFromCustomer(c){\n  if(c.name)setValue(\'customer_name\',c.name);\n  if(c.street_address)setValue(\'street_address\',c.street_address);\n  if(c.city)setValue(\'city\',c.city);\n  if(c.phone)setValue(\'phone_number\',c.phone);\n}\nfunction setValue(id,val){const el=document.getElementById(id);if(el)el.value=val}\nasync function lookupByPhone(){\n  const phone=document.getElementById(\'phone_number\')?.value.trim();\n  if(!phone)return;\n  const c=await(await fetch(\'/api/customers/lookup?phone=\'+encodeURIComponent(phone))).json();\n  if(c&&c.name)fillFromCustomer(c);\n}\ndocument.addEventListener(\'click\',e=>{if(!e.target.closest(\'.autocomplete-wrap\'))clearAC()});\n\n/* --- Pickup form --- */\nasync function submitPickup(e){\n  e.preventDefault();\n  const f=e.target;\n  const data={\n    pickup_date:f.pickup_date.value,pickup_time:f.pickup_time.value,\n    street_address:f.street_address.value,city:f.city.value,\n    customer_name:f.customer_name.value,phone_number:f.phone_number.value,\n    destination_address:f.destination_address.value,\n    meter_total:f.meter_total.value,payment_method:f.payment_method.value,\n    tip:f.tip.value,tip_payment_method:f.tip_payment_method.value,\n  };\n  const r=await fetch(\'/api/pickups\',{method:\'POST\',\n    headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify(data)});\n  if(r.ok){\n    showToast(\'Pickup recorded!\');\n    resetForm();\n    const ld=document.getElementById(\'logDate\');\n    if(ld&&data.pickup_date)ld.value=data.pickup_date;\n    loadDailyLog();\n  }else showToast(\'Error saving pickup\');\n}\nfunction resetForm(){\n  const f=document.getElementById(\'pickupForm\');if(!f)return;\n  [\'street_address\',\'city\',\'customer_name\',\'phone_number\',\'destination_address\',\'meter_total\',\'tip\']\n    .forEach(id=>setValue(id,\'\'));\n  [\'payment_method\',\'tip_payment_method\'].forEach(id=>setValue(id,\'\'));\n  updateCalcTotal();clearAC();\n}\n\n/* --- Daily log --- */\nasync function loadDailyLog(){\n  const el=document.getElementById(\'logDate\');if(!el)return;\n  const pickups=await(await fetch(\'/api/pickups?date=\'+el.value)).json();\n  renderLog(pickups);\n}\n\nfunction pmBadge(pm){\n  if(!pm)return\'\';\n  const cls={\'cash\':\'pm-cash\',\'credit\':\'pm-credit\',\'voucher\':\'pm-voucher\'}[pm.toLowerCase()]||\'pm-none\';\n  return\'<span class="pm-badge \'+cls+\'">\'+pm+\'</span>\';\n}\n\nfunction renderLog(pickups){\n  const list=document.getElementById(\'logList\');\n  const tp=document.getElementById(\'dailyTotals\');\n  if(!list)return;\n  if(!pickups.length){\n    list.innerHTML=\'<p class="empty-msg">No pickups recorded for this date.</p>\';\n    if(tp)tp.style.display=\'none\';\n    return;\n  }\n  list.innerHTML=pickups.map(p=>{\n    const tipHtml=p.tip>0?\'<span class="pickup-meta-item">Tip: \'+fmt(p.tip)+\' \'+pmBadge(p.tip_payment_method)+\'</span>\':\'\';\n    const custHtml=(p.customer_name?\'<span class="pickup-meta-item">\'+p.customer_name+\'</span>\':\'\');\n    const phoneHtml=(p.phone_number?\'<span class="pickup-meta-item">\'+p.phone_number+\'</span>\':\'\');\n    const noInfo=(!p.customer_name&&!p.phone_number&&!p.tip)?\'<span style="color:var(--text3);font-style:italic">No customer info</span>\':\'\';\n    return\'<div class="pickup-card" data-id="\'+p.id+\'">\'\n      +\'<div class="pickup-card-head">\'\n        +\'<span class="pickup-time">\'+(p.pickup_time||\'--:--\')+\'</span>\'\n        +\'<div class="pickup-total-wrap">\'\n          +\'<span class="pickup-total">\'+fmt(p.calculated_total)+\'</span>\'\n          +pmBadge(p.payment_method)\n        +\'</div>\'\n      +\'</div>\'\n      +\'<div class="pickup-card-body">\'\n        +\'<div class="pickup-route">\'\n          +\'<strong>\'+p.street_address+(p.city?\', \'+p.city:\'\')+\'</strong>\'\n          +\' <span style="color:var(--text3)">→</span> \'\n          +p.destination_address\n        +\'</div>\'\n        +\'<div class="pickup-meta">\'+custHtml+phoneHtml+tipHtml+noInfo+\'</div>\'\n      +\'</div>\'\n      +\'<div class="pickup-card-foot">\'\n        +\'<button class="btn btn-sm btn-ghost" data-action="edit" data-id="\'+p.id+\'">Edit</button>\'\n        +\'<button class="btn btn-sm btn-danger" data-action="delete" data-id="\'+p.id+\'">Delete</button>\'\n      +\'</div>\'\n    +\'</div>\';\n  }).join(\'\');\n  renderTotals(pickups);\n}\n\n/* Event delegation for edit/delete buttons */\ndocument.addEventListener(\'click\',e=>{\n  const btn=e.target.closest(\'[data-action]\');\n  if(!btn)return;\n  const id=btn.dataset.id;\n  if(btn.dataset.action===\'edit\')openEdit(id);\n  if(btn.dataset.action===\'delete\')deletePickup(id);\n});\n\nfunction renderTotals(pickups){\n  const tp=document.getElementById(\'dailyTotals\');\n  const grid=document.getElementById(\'totalsGrid\');\n  const owedEl=document.getElementById(\'owedDriverVal\');\n  if(!tp)return;\n  let mCa=0,mCr=0,mV=0,tCa=0,tCr=0,tV=0,grand=0;\n  pickups.forEach(p=>{\n    const pm=(p.payment_method||\'\').toLowerCase();\n    const tpm=(p.tip_payment_method||\'\').toLowerCase();\n    const m=parseFloat(p.meter_total)||0;\n    const t=parseFloat(p.tip)||0;\n    if(pm===\'cash\')mCa+=m; else if(pm===\'credit\')mCr+=m; else if(pm===\'voucher\')mV+=m;\n    if(tpm===\'cash\')tCa+=t; else if(tpm===\'credit\')tCr+=t; else if(tpm===\'voucher\')tV+=t;\n    grand+=parseFloat(p.calculated_total)||0;\n  });\n  const owedAmt=((mCr+mV)-mCa)/2+tCr+tV;\n  if(grid)grid.innerHTML=[\n    [\'Cash Meter\',fmt(mCa)],[\'Credit Meter\',fmt(mCr)],[\'Voucher Meter\',fmt(mV)],\n    [\'Cash Tips\',fmt(tCa)],[\'Credit Tips\',fmt(tCr)],[\'Voucher Tips\',fmt(tV)],\n    [\'Grand Total\',fmt(grand)],[\'Pickups\',pickups.length],\n  ].map(([l,v])=>\'<div class="total-cell"><div class="total-cell-label">\'+l+\'</div><div class="total-cell-val">\'+v+\'</div></div>\').join(\'\');\n  if(owedEl)owedEl.textContent=fmt(owedAmt);\n  tp.style.display=\'block\';\n}\n\n/* --- Edit modal --- */\nasync function openEdit(id){\n  const p=await(await fetch(\'/api/pickups/\'+id)).json();\n  const body=document.getElementById(\'editModalBody\');\n  const pmOpts=[\'\',\'Cash\',\'Credit\',\'Voucher\'].map(v=>\'<option\'+(p.payment_method===v?\' selected\':\'\')+\'>\'+v+\'</option>\').join(\'\');\n  const tpmOpts=[\'\',\'Cash\',\'Credit\',\'Voucher\'].map(v=>\'<option\'+(p.tip_payment_method===v?\' selected\':\'\')+\'>\'+v+\'</option>\').join(\'\');\n  body.innerHTML=\n    \'<div class="row-2">\'\n      +\'<div class="field-group"><label class="field-label">Date</label><input type="date" id="e_date" class="field-input" value="\'+p.pickup_date+\'"></div>\'\n      +\'<div class="field-group"><label class="field-label">Time</label><input type="time" id="e_time" class="field-input" value="\'+p.pickup_time+\'"></div>\'\n    +\'</div>\'\n    +\'<div class="field-group"><label class="field-label">Street Address</label><input type="text" id="e_street" class="field-input" value="\'+p.street_address+\'"></div>\'\n    +\'<div class="row-2">\'\n      +\'<div class="field-group"><label class="field-label">City</label><input type="text" id="e_city" class="field-input" value="\'+(p.city||\'\')+\'"></div>\'\n      +\'<div class="field-group"><label class="field-label">Phone</label><input type="text" id="e_phone" class="field-input" value="\'+(p.phone_number||\'\')+\'"></div>\'\n    +\'</div>\'\n    +\'<div class="field-group"><label class="field-label">Customer Name</label><input type="text" id="e_name" class="field-input" value="\'+(p.customer_name||\'\')+\'"></div>\'\n    +\'<div class="field-group"><label class="field-label">Destination</label><input type="text" id="e_dest" class="field-input" value="\'+p.destination_address+\'"></div>\'\n    +\'<div class="row-2">\'\n      +\'<div class="field-group"><label class="field-label">Meter ($)</label><input type="number" id="e_meter" class="field-input" step="0.01" value="\'+(p.meter_total||0)+\'" oninput="eCalc()"></div>\'\n      +\'<div class="field-group"><label class="field-label">Payment</label><select id="e_pm" class="field-input">\'+pmOpts+\'</select></div>\'\n    +\'</div>\'\n    +\'<div class="row-2">\'\n      +\'<div class="field-group"><label class="field-label">Tip ($)</label><input type="number" id="e_tip" class="field-input" step="0.01" value="\'+(p.tip||0)+\'" oninput="eCalc()"></div>\'\n      +\'<div class="field-group"><label class="field-label">Tip Payment</label><select id="e_tpm" class="field-input">\'+tpmOpts+\'</select></div>\'\n    +\'</div>\'\n    +\'<div class="calc-total-bar"><span class="calc-total-label">Calculated Total</span><span id="e_calc" class="calc-total-value">\'+fmt(p.calculated_total)+\'</span></div>\'\n    +\'<div class="btn-group mt-2">\'\n      +\'<button class="btn btn-primary" data-action="save-edit" data-id="\'+id+\'">Save Changes</button>\'\n      +\'<button class="btn btn-ghost" onclick="closeModal(\\\'editModal\\\')">Cancel</button>\'\n    +\'</div>\';\n  openModal(\'editModal\');\n}\nfunction eCalc(){\n  const m=parseFloat(document.getElementById(\'e_meter\')?.value)||0;\n  const t=parseFloat(document.getElementById(\'e_tip\')?.value)||0;\n  const el=document.getElementById(\'e_calc\');if(el)el.textContent=fmt(m+t);\n}\ndocument.addEventListener(\'click\',async e=>{\n  const btn=e.target.closest(\'[data-action="save-edit"]\');\n  if(!btn)return;\n  const id=btn.dataset.id;\n  const data={\n    pickup_date:document.getElementById(\'e_date\').value,\n    pickup_time:document.getElementById(\'e_time\').value,\n    street_address:document.getElementById(\'e_street\').value,\n    city:document.getElementById(\'e_city\').value,\n    customer_name:document.getElementById(\'e_name\').value,\n    phone_number:document.getElementById(\'e_phone\').value,\n    destination_address:document.getElementById(\'e_dest\').value,\n    meter_total:document.getElementById(\'e_meter\').value,\n    payment_method:document.getElementById(\'e_pm\').value,\n    tip:document.getElementById(\'e_tip\').value,\n    tip_payment_method:document.getElementById(\'e_tpm\').value,\n  };\n  const r=await fetch(\'/api/pickups/\'+id,{method:\'PUT\',\n    headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify(data)});\n  if(r.ok){closeModal(\'editModal\');showToast(\'Record updated!\');loadDailyLog();}\n  else showToast(\'Error updating record\');\n});\n\nasync function deletePickup(id){\n  if(!confirm(\'Delete this pickup record?\'))return;\n  const r=await fetch(\'/api/pickups/\'+id,{method:\'DELETE\'});\n  if(r.ok){showToast(\'Pickup deleted\');loadDailyLog();}\n  else showToast(\'Error deleting record\');\n}\n\n/* --- Delete all --- */\nasync function deleteAll(){\n  if(!confirm(\'Delete ALL pickups and customers?\\nDriver profile will NOT be deleted.\'))return;\n  const r=await fetch(\'/api/pickups\',{method:\'DELETE\'});\n  if(r.ok){showToast(\'All pickups and customers deleted\');closeModal(\'backupModal\');loadDailyLog();}\n  else showToast(\'Error during deletion\');\n}\n\n/* --- Report --- */\nasync function generateReport(){\n  const from=document.getElementById(\'rptFrom\').value;\n  const to=document.getElementById(\'rptTo\').value;\n  let url=\'/api/report\';\n  const p=[];\n  if(from)p.push(\'from_date=\'+from);\n  if(to)p.push(\'to_date=\'+to);\n  if(p.length)url+=\'?\'+p.join(\'&\');\n  renderReport(await(await fetch(url)).json());\n}\nfunction renderReport(data){\n  const out=document.getElementById(\'reportOutput\');\n  if(!data.days.length){out.innerHTML=\'<p class="empty-msg">No pickups found.</p>\';return}\n  const dayBlocks=data.days.map(day=>{\n    const rows=day.pickups.map(p=>\n      \'<tr><td>\'+(p.pickup_time||\'\')+\'</td>\'\n      +\'<td>\'+p.street_address+(p.city?\', \'+p.city:\'\')+\'</td>\'\n      +\'<td>\'+p.destination_address+\'</td>\'\n      +\'<td>\'+(p.customer_name||\'—\')+\'</td>\'\n      +\'<td>\'+fmt(p.meter_total)+\'</td>\'\n      +\'<td>\'+(p.payment_method||\'—\')+\'</td>\'\n      +\'<td>\'+fmt(p.tip)+\'</td>\'\n      +\'<td>\'+fmt(p.calculated_total)+\'</td></tr>\'\n    ).join(\'\');\n    const t=day.totals;\n    return\'<div class="report-day">\'\n      +\'<div class="report-day-hdr"><span style="font-weight:700">\'+day.date+\'</span>\'\n        +\'<span style="font-size:12px;color:rgba(255,255,255,.5)">\'+t.count+\' pickups &nbsp; \'+fmt(t.grand_total)+\'</span></div>\'\n      +\'<table class="report-table"><thead><tr>\'\n        +\'<th>Time</th><th>From</th><th>To</th><th>Customer</th>\'\n        +\'<th>Meter</th><th>Pay</th><th>Tip</th><th>Total</th>\'\n      +\'</tr></thead><tbody>\'+rows+\'</tbody></table>\'\n      +\'<div class="report-day-foot">\'\n        +\'<span>Cash: \'+fmt(t.meter_cash)+\'</span>\'\n        +\'<span>Credit: \'+fmt(t.meter_credit)+\'</span>\'\n        +\'<span>Voucher: \'+fmt(t.meter_voucher)+\'</span>\'\n        +\'<span>Tips: \'+fmt(t.tip_cash+t.tip_credit+t.tip_voucher)+\'</span>\'\n        +\'<strong>Owed Driver: \'+fmt(t.owed_driver)+\'</strong>\'\n      +\'</div>\'\n    +\'</div>\';\n  }).join(\'\');\n  const s=data.summary;\n  out.innerHTML=dayBlocks\n    +\'<div class="report-summary"><h3>Summary</h3><div class="summary-grid">\'\n    +[[\'Pickups\',s.count],[\'Cash\',fmt(s.meter_cash)],[\'Credit\',fmt(s.meter_credit)],\n      [\'Voucher\',fmt(s.meter_voucher)],[\'Credit Tips\',fmt(s.tip_credit)],\n      [\'Voucher Tips\',fmt(s.tip_voucher)],[\'Grand Total\',fmt(s.grand_total)],\n      [\'Total Owed\',fmt(s.owed_driver)]]\n    .map(([l,v],i)=>\'<div class="summary-item"><div class="summary-label">\'+l+\'</div>\'\n      +\'<div class="summary-val\'+(i===7?\' summary-owed\':\'\')+\'">\'+v+\'</div></div>\').join(\'\')\n    +\'</div></div>\';\n}\n\n/* --- Restore --- */\nasync function restoreFile(type){\n  const inputId=\'restore\'+type.charAt(0).toUpperCase()+type.slice(1);\n  const input=document.getElementById(inputId);\n  if(!input?.files?.length){showToast(\'Please select a JSON file first\');return}\n  if(!confirm(\'Restore \'+type+\'? This will overwrite current data.\'))return;\n  const form=new FormData();form.append(\'file\',input.files[0]);\n  const r=await fetch(\'/api/restore/\'+type,{method:\'POST\',body:form});\n  if(r.ok){\n    showToast(type+\' restored successfully\');\n    if(type===\'pickups\')loadDailyLog();\n    if(type===\'profile\')window.location.reload();\n  }else{\n    const err=await r.json().catch(()=>({}));\n    showToast(err.detail||\'Restore failed\');\n  }\n}\n'
+JS = """/* app.js */
+function fmt(v){return '$'+(parseFloat(v)||0).toFixed(2)}
 
-# ── write assets to disk ────────────────────────────────────────
+function showToast(msg,d=2500){
+  const t=document.getElementById('toast');
+  t.textContent=msg;t.style.display='block';
+  clearTimeout(t._t);t._t=setTimeout(()=>t.style.display='none',d);
+}
+function openModal(id){document.getElementById(id).style.display='flex'}
+function closeModal(id){document.getElementById(id).style.display='none'}
+document.querySelectorAll('.modal-overlay').forEach(el=>{
+  el.addEventListener('click',e=>{if(e.target===el)el.style.display='none'});
+});
+
+function updateCalcTotal(){
+  const m=parseFloat(document.getElementById('meter_total')?.value)||0;
+  const t=parseFloat(document.getElementById('tip')?.value)||0;
+  const el=document.getElementById('calcTotal');
+  if(el)el.textContent=fmt(m+t);
+}
+
+/* --- Autocomplete --- */
+let acTimer=null;
+function suggestCustomers(input,field){
+  clearTimeout(acTimer);
+  const q=input.value.trim();
+  const listId=field==='phone'?'ac-phone':field==='address'?'ac-address':'ac-name';
+  if(q.length<2){clearAC();return}
+  acTimer=setTimeout(async()=>{
+    const r=await fetch('/api/customers/suggest?q='+encodeURIComponent(q));
+    renderAC(listId,await r.json());
+  },200);
+}
+function renderAC(listId,customers){
+  clearAC();
+  if(!customers.length)return;
+  const list=document.getElementById(listId);
+  customers.forEach(c=>{
+    const d=document.createElement('div');
+    d.className='ac-item';
+    d.innerHTML='<div class="ac-name">'+(c.name||'—')+'</div>'
+      +'<div class="ac-detail">'+(c.street_address||'')+' '+(c.city||'')+(c.phone?' · '+c.phone:'')+'</div>';
+    d.onclick=()=>{fillFromCustomer(c);clearAC()};
+    list.appendChild(d);
+  });
+}
+function clearAC(){
+  ['ac-phone','ac-address','ac-name'].forEach(id=>{
+    const el=document.getElementById(id);if(el)el.innerHTML='';
+  });
+}
+function fillFromCustomer(c){
+  if(c.name)setValue('customer_name',c.name);
+  if(c.street_address)setValue('street_address',c.street_address);
+  if(c.city)setValue('city',c.city);
+  if(c.phone)setValue('phone_number',c.phone);
+}
+function setValue(id,val){const el=document.getElementById(id);if(el)el.value=val}
+async function lookupByPhone(){
+  const phone=document.getElementById('phone_number')?.value.trim();
+  if(!phone)return;
+  const c=await(await fetch('/api/customers/lookup?phone='+encodeURIComponent(phone))).json();
+  if(c&&c.name)fillFromCustomer(c);
+}
+document.addEventListener('click',e=>{if(!e.target.closest('.autocomplete-wrap'))clearAC()});
+
+/* --- Pickup form --- */
+async function submitPickup(e){
+  e.preventDefault();
+  const f=e.target;
+  const data={
+    pickup_date:f.pickup_date.value,pickup_time:f.pickup_time.value,
+    street_address:f.street_address.value,city:f.city.value,
+    customer_name:f.customer_name.value,phone_number:f.phone_number.value,
+    destination_address:f.destination_address.value,
+    meter_total:f.meter_total.value,payment_method:f.payment_method.value,
+    tip:f.tip.value,tip_payment_method:f.tip_payment_method.value,
+  };
+  const r=await fetch('/api/pickups',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  if(r.ok){
+    showToast('Pickup recorded!');
+    resetForm();
+    const ld=document.getElementById('logDate');
+    if(ld&&data.pickup_date)ld.value=data.pickup_date;
+    loadDailyLog();
+  }else showToast('Error saving pickup');
+}
+function resetForm(){
+  const f=document.getElementById('pickupForm');if(!f)return;
+  ['street_address','city','customer_name','phone_number','destination_address','meter_total','tip']
+    .forEach(id=>setValue(id,''));
+  ['payment_method','tip_payment_method'].forEach(id=>setValue(id,''));
+  updateCalcTotal();clearAC();
+}
+
+/* --- Daily log (fetches server-side totals) --- */
+async function loadDailyLog(){
+  const el=document.getElementById('logDate');if(!el)return;
+  const d=el.value;
+  const [pickups,totals]=await Promise.all([
+    fetch('/api/pickups?date='+d).then(r=>r.json()),
+    fetch('/api/daily-totals?date='+d).then(r=>r.json())
+  ]);
+  renderLog(pickups);
+  if(pickups.length||(totals&&totals.expense_total>0)) renderTotals(totals);
+  else{const tp=document.getElementById('dailyTotals');if(tp)tp.style.display='none';}
+}
+
+function pmBadge(pm){
+  if(!pm)return'';
+  const cls={'cash':'pm-cash','credit':'pm-credit','voucher':'pm-voucher'}[pm.toLowerCase()]||'pm-none';
+  return'<span class="pm-badge '+cls+'">'+pm+'</span>';
+}
+
+function renderLog(pickups){
+  const list=document.getElementById('logList');
+  if(!list)return;
+  if(!pickups.length){
+    list.innerHTML='<p class="empty-msg">No pickups recorded for this date.</p>';
+    return;
+  }
+  list.innerHTML=pickups.map(p=>{
+    const tipHtml=p.tip>0?'<span class="pickup-meta-item">Tip: '+fmt(p.tip)+' '+pmBadge(p.tip_payment_method)+'</span>':'';
+    const custHtml=(p.customer_name?'<span class="pickup-meta-item">'+p.customer_name+'</span>':'');
+    const phoneHtml=(p.phone_number?'<span class="pickup-meta-item">'+p.phone_number+'</span>':'');
+    const noInfo=(!p.customer_name&&!p.phone_number&&!p.tip)?'<span style="color:var(--text3);font-style:italic">No customer info</span>':'';
+    return'<div class="pickup-card" data-id="'+p.id+'">'
+      +'<div class="pickup-card-head">'
+        +'<span class="pickup-time">'+(p.pickup_time||'--:--')+'</span>'
+        +'<div class="pickup-total-wrap">'
+          +'<span class="pickup-total">'+fmt(p.calculated_total)+'</span>'
+          +pmBadge(p.payment_method)
+        +'</div>'
+      +'</div>'
+      +'<div class="pickup-card-body">'
+        +'<div class="pickup-route">'
+          +'<strong>'+p.street_address+(p.city?', '+p.city:'')+'</strong>'
+          +' <span style="color:var(--text3)">→</span> '
+          +p.destination_address
+        +'</div>'
+        +'<div class="pickup-meta">'+custHtml+phoneHtml+tipHtml+noInfo+'</div>'
+      +'</div>'
+      +'<div class="pickup-card-foot">'
+        +'<button class="btn btn-sm btn-ghost" data-action="edit" data-id="'+p.id+'">Edit</button>'
+        +'<button class="btn btn-sm btn-danger" data-action="delete" data-id="'+p.id+'">Delete</button>'
+      +'</div>'
+    +'</div>';
+  }).join('');
+}
+
+/* Event delegation for edit/delete buttons */
+document.addEventListener('click',e=>{
+  const btn=e.target.closest('[data-action]');
+  if(!btn)return;
+  const id=btn.dataset.id;
+  if(btn.dataset.action==='edit')openEdit(id);
+  if(btn.dataset.action==='delete')deletePickup(id);
+});
+
+function renderTotals(t){
+  const tp=document.getElementById('dailyTotals');
+  const grid=document.getElementById('totalsGrid');
+  const owedEl=document.getElementById('owedDriverVal');
+  const owedLabel=document.getElementById('owedDriverLabel');
+  if(!tp)return;
+  const hasExp=t.expense_total>0;
+  const cells=[
+    ['Cash Meter',fmt(t.meter_cash)],['Credit Meter',fmt(t.meter_credit)],
+    ['Voucher Meter',fmt(t.meter_voucher)],['Cash Tips',fmt(t.tip_cash)],
+    ['Credit Tips',fmt(t.tip_credit)],['Voucher Tips',fmt(t.tip_voucher)],
+    ['Expenses',fmt(t.expense_total||0)],['Pickups',t.count],
+  ];
+  if(grid)grid.innerHTML=cells.map(([l,v])=>
+    '<div class="total-cell"><div class="total-cell-label">'+l+'</div><div class="total-cell-val">'+v+'</div></div>'
+  ).join('');
+  const net=t.net_earnings!==undefined?t.net_earnings:t.owed_driver;
+  if(owedEl)owedEl.textContent=fmt(net);
+  if(owedLabel)owedLabel.textContent=hasExp?'Net After Expenses':'Owed Driver';
+  tp.style.display='block';
+}
+
+/* --- Edit modal --- */
+async function openEdit(id){
+  const p=await(await fetch('/api/pickups/'+id)).json();
+  const body=document.getElementById('editModalBody');
+  const pmOpts=['','Cash','Credit','Voucher'].map(v=>'<option'+(p.payment_method===v?' selected':'')+'>'+v+'</option>').join('');
+  const tpmOpts=['','Cash','Credit','Voucher'].map(v=>'<option'+(p.tip_payment_method===v?' selected':'')+'>'+v+'</option>').join('');
+  body.innerHTML=
+    '<div class="row-2">'
+      +'<div class="field-group"><label class="field-label">Date</label><input type="date" id="e_date" class="field-input" value="'+p.pickup_date+'"></div>'
+      +'<div class="field-group"><label class="field-label">Time</label><input type="time" id="e_time" class="field-input" value="'+p.pickup_time+'"></div>'
+    +'</div>'
+    +'<div class="field-group"><label class="field-label">Street Address</label><input type="text" id="e_street" class="field-input" value="'+p.street_address+'"></div>'
+    +'<div class="row-2">'
+      +'<div class="field-group"><label class="field-label">City</label><input type="text" id="e_city" class="field-input" value="'+(p.city||'')+'"></div>'
+      +'<div class="field-group"><label class="field-label">Phone</label><input type="text" id="e_phone" class="field-input" value="'+(p.phone_number||'')+'"></div>'
+    +'</div>'
+    +'<div class="field-group"><label class="field-label">Customer Name</label><input type="text" id="e_name" class="field-input" value="'+(p.customer_name||'')+'"></div>'
+    +'<div class="field-group"><label class="field-label">Destination</label><input type="text" id="e_dest" class="field-input" value="'+p.destination_address+'"></div>'
+    +'<div class="row-2">'
+      +'<div class="field-group"><label class="field-label">Meter ($)</label><input type="number" id="e_meter" class="field-input" step="0.01" value="'+(p.meter_total||0)+'" oninput="eCalc()"></div>'
+      +'<div class="field-group"><label class="field-label">Payment</label><select id="e_pm" class="field-input">'+pmOpts+'</select></div>'
+    +'</div>'
+    +'<div class="row-2">'
+      +'<div class="field-group"><label class="field-label">Tip ($)</label><input type="number" id="e_tip" class="field-input" step="0.01" value="'+(p.tip||0)+'" oninput="eCalc()"></div>'
+      +'<div class="field-group"><label class="field-label">Tip Payment</label><select id="e_tpm" class="field-input">'+tpmOpts+'</select></div>'
+    +'</div>'
+    +'<div class="calc-total-bar"><span class="calc-total-label">Calculated Total</span><span id="e_calc" class="calc-total-value">'+fmt(p.calculated_total)+'</span></div>'
+    +'<div class="btn-group mt-2">'
+      +'<button class="btn btn-primary" data-action="save-edit" data-id="'+id+'">Save Changes</button>'
+      +'<button class="btn btn-ghost" onclick="closeModal(\'editModal\')">Cancel</button>'
+    +'</div>';
+  openModal('editModal');
+}
+function eCalc(){
+  const m=parseFloat(document.getElementById('e_meter')?.value)||0;
+  const t=parseFloat(document.getElementById('e_tip')?.value)||0;
+  const el=document.getElementById('e_calc');if(el)el.textContent=fmt(m+t);
+}
+document.addEventListener('click',async e=>{
+  const btn=e.target.closest('[data-action="save-edit"]');
+  if(!btn)return;
+  const id=btn.dataset.id;
+  const data={
+    pickup_date:document.getElementById('e_date').value,
+    pickup_time:document.getElementById('e_time').value,
+    street_address:document.getElementById('e_street').value,
+    city:document.getElementById('e_city').value,
+    customer_name:document.getElementById('e_name').value,
+    phone_number:document.getElementById('e_phone').value,
+    destination_address:document.getElementById('e_dest').value,
+    meter_total:document.getElementById('e_meter').value,
+    payment_method:document.getElementById('e_pm').value,
+    tip:document.getElementById('e_tip').value,
+    tip_payment_method:document.getElementById('e_tpm').value,
+  };
+  const r=await fetch('/api/pickups/'+id,{method:'PUT',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  if(r.ok){closeModal('editModal');showToast('Record updated!');loadDailyLog();}
+  else showToast('Error updating record');
+});
+
+async function deletePickup(id){
+  if(!confirm('Delete this pickup record?'))return;
+  const r=await fetch('/api/pickups/'+id,{method:'DELETE'});
+  if(r.ok){showToast('Pickup deleted');loadDailyLog();}
+  else showToast('Error deleting record');
+}
+
+/* --- Delete all --- */
+async function deleteAll(){
+  if(!confirm('Delete ALL pickups and customers?\\nDriver profile will NOT be deleted.'))return;
+  const r=await fetch('/api/pickups',{method:'DELETE'});
+  if(r.ok){showToast('All pickups and customers deleted');closeModal('backupModal');loadDailyLog();}
+  else showToast('Error during deletion');
+}
+
+/* --- Expense Modal --- */
+function openExpenseModal(){
+  const d=document.getElementById('logDate');
+  const expDate=document.getElementById('exp_date');
+  if(d&&expDate)expDate.value=d.value;
+  loadExpenses();
+  openModal('expenseModal');
+}
+
+async function loadExpenses(){
+  const dateEl=document.getElementById('exp_date');
+  if(!dateEl||!dateEl.value)return;
+  const expenses=await fetch('/api/expenses?date='+dateEl.value).then(r=>r.json());
+  renderExpenses(expenses);
+}
+
+function renderExpenses(expenses){
+  const list=document.getElementById('expenseList');
+  const bar=document.getElementById('expenseTotalBar');
+  const totalEl=document.getElementById('expenseTotalVal');
+  if(!list)return;
+  if(!expenses.length){
+    list.innerHTML='<p class="empty-msg">No expenses for this date.</p>';
+    if(bar)bar.style.display='none';
+    return;
+  }
+  const total=expenses.reduce((s,e)=>s+(e.amount||0),0);
+  list.innerHTML=expenses.map(e=>
+    '<div class="expense-item">'
+      +'<div class="expense-item-left">'
+        +'<span class="expense-cat-badge">'+e.category+'</span>'
+        +(e.notes?'<span class="expense-notes">'+e.notes+'</span>':'')
+      +'</div>'
+      +'<div class="expense-item-right">'
+        +'<span class="expense-amt">'+fmt(e.amount)+'</span>'
+        +'<button class="btn btn-sm btn-danger" onclick="deleteExpense(\''+e.id+'\')">✕</button>'
+      +'</div>'
+    +'</div>'
+  ).join('');
+  if(totalEl)totalEl.textContent=fmt(total);
+  if(bar)bar.style.display='flex';
+}
+
+async function submitExpense(e){
+  e.preventDefault();
+  const data={
+    date:document.getElementById('exp_date').value,
+    amount:document.getElementById('exp_amount').value,
+    category:document.getElementById('exp_category').value,
+    notes:document.getElementById('exp_notes').value,
+  };
+  const r=await fetch('/api/expenses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  if(r.ok){
+    showToast('Expense added');
+    setValue('exp_amount','');setValue('exp_notes','');setValue('exp_category','');
+    loadExpenses();
+    loadDailyLog();
+  }else showToast('Error saving expense');
+}
+
+async function deleteExpense(id){
+  if(!confirm('Delete this expense?'))return;
+  const r=await fetch('/api/expenses/'+id,{method:'DELETE'});
+  if(r.ok){showToast('Expense deleted');loadExpenses();loadDailyLog();}
+  else showToast('Error deleting expense');
+}
+
+/* --- Shift Modal --- */
+function openShiftModal(){
+  const d=document.getElementById('logDate');
+  const shDate=document.getElementById('sh_date');
+  if(d&&shDate)shDate.value=d.value;
+  loadShift();
+  openModal('shiftModal');
+}
+
+async function loadShift(){
+  const dateEl=document.getElementById('sh_date');
+  if(!dateEl||!dateEl.value)return;
+  const shifts=await fetch('/api/shifts?date='+dateEl.value).then(r=>r.json());
+  const savedEl=document.getElementById('shiftSaved');
+  if(shifts.length){
+    const s=shifts[0];
+    setValue('sh_start',s.start_time||'');
+    setValue('sh_end',s.end_time||'');
+    setValue('sh_odo_start',s.odometer_start>0?s.odometer_start:'');
+    setValue('sh_odo_end',s.odometer_end>0?s.odometer_end:'');
+    setValue('sh_notes',s.notes||'');
+    calcShiftStats();
+    renderShiftSaved(s);
+  }else{
+    if(savedEl)savedEl.style.display='none';
+  }
+}
+
+function calcShiftStats(){
+  const s=document.getElementById('sh_start')?.value;
+  const e=document.getElementById('sh_end')?.value;
+  const os=parseFloat(document.getElementById('sh_odo_start')?.value)||0;
+  const oe=parseFloat(document.getElementById('sh_odo_end')?.value)||0;
+  const bar=document.getElementById('shiftStatsBar');
+  let show=false;
+  if(oe>os){document.getElementById('shiftMilesVal').textContent=Math.round(oe-os);show=true;}
+  if(s&&e){
+    const sm=parseInt(s.split(':')[0])*60+parseInt(s.split(':')[1]);
+    const em=parseInt(e.split(':')[0])*60+parseInt(e.split(':')[1]);
+    let diff=em-sm;if(diff<0)diff+=1440;
+    document.getElementById('shiftHoursVal').textContent=(diff/60).toFixed(1);show=true;
+  }
+  if(bar)bar.style.display=show?'flex':'none';
+}
+
+async function submitShift(e){
+  e.preventDefault();
+  const data={
+    date:document.getElementById('sh_date').value,
+    start_time:document.getElementById('sh_start').value,
+    end_time:document.getElementById('sh_end').value,
+    odometer_start:document.getElementById('sh_odo_start').value||0,
+    odometer_end:document.getElementById('sh_odo_end').value||0,
+    notes:document.getElementById('sh_notes').value,
+  };
+  const r=await fetch('/api/shifts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  if(r.ok){showToast('Shift saved');renderShiftSaved(await r.json());}
+  else showToast('Error saving shift');
+}
+
+function renderShiftSaved(s){
+  const el=document.getElementById('shiftSaved');
+  if(!el)return;
+  let hours='—';
+  if(s.start_time&&s.end_time){
+    const sm=parseInt(s.start_time.split(':')[0])*60+parseInt(s.start_time.split(':')[1]);
+    const em=parseInt(s.end_time.split(':')[0])*60+parseInt(s.end_time.split(':')[1]);
+    let d=em-sm;if(d<0)d+=1440;
+    hours=(d/60).toFixed(1)+' hrs';
+  }
+  el.innerHTML='<div class="shift-saved">'
+    +'<div class="shift-saved-row"><span>Start</span><strong>'+(s.start_time||'—')+'</strong></div>'
+    +'<div class="shift-saved-row"><span>End</span><strong>'+(s.end_time||'—')+'</strong></div>'
+    +'<div class="shift-saved-row"><span>Hours</span><strong>'+hours+'</strong></div>'
+    +'<div class="shift-saved-row"><span>Miles</span><strong>'+(s.miles>0?Math.round(s.miles)+' mi':'—')+'</strong></div>'
+    +(s.notes?'<div class="shift-saved-row"><span>Notes</span><strong>'+s.notes+'</strong></div>':'')
+  +'</div>';
+  el.style.display='block';
+}
+
+/* --- Report --- */
+async function generateReport(){
+  const from=document.getElementById('rptFrom').value;
+  const to=document.getElementById('rptTo').value;
+  let url='/api/report';
+  const p=[];
+  if(from)p.push('from_date='+from);
+  if(to)p.push('to_date='+to);
+  if(p.length)url+='?'+p.join('&');
+  renderReport(await(await fetch(url)).json());
+}
+
+function renderReport(data){
+  const out=document.getElementById('reportOutput');
+  if(!data.days||!data.days.length){out.innerHTML='<p class="empty-msg">No data found for this date range.</p>';return}
+  const modeLabels={standard:'Standard Split',gate:'Flat Gate Fee',commission:'Commission Split',owner:'Owner-Operator'};
+  const modeLabel=modeLabels[data.summary.pay_mode]||'Standard';
+  const dayBlocks=data.days.map(day=>{
+    const rows=day.pickups.map(p=>
+      '<tr><td>'+(p.pickup_time||'')+'</td>'
+      +'<td>'+p.street_address+(p.city?', '+p.city:'')+'</td>'
+      +'<td>'+p.destination_address+'</td>'
+      +'<td>'+(p.customer_name||'—')+'</td>'
+      +'<td>'+fmt(p.meter_total)+'</td>'
+      +'<td>'+(p.payment_method||'—')+'</td>'
+      +'<td>'+fmt(p.tip)+'</td>'
+      +'<td>'+fmt(p.calculated_total)+'</td></tr>'
+    ).join('');
+    const expRows=(day.expenses&&day.expenses.length)?
+      day.expenses.map(e=>
+        '<tr class="report-expense-row"><td colspan="4">💸 '+e.category+(e.notes?' – '+e.notes:'')+'</td>'
+        +'<td colspan="4" style="text-align:right">− '+fmt(e.amount)+'</td></tr>'
+      ).join(''):'';
+    const t=day.totals;
+    const sh=day.shift;
+    const shiftBar=sh?(sh.start_time||sh.end_time||sh.miles>0?
+      '⏱ '+(sh.start_time?'In: '+sh.start_time:'')+
+      (sh.end_time?' Out: '+sh.end_time:'')+
+      (sh.miles>0?' | '+Math.round(sh.miles)+' mi':''):''):'';
+    return'<div class="report-day">'
+      +'<div class="report-day-hdr"><span style="font-weight:700">'+day.date+'</span>'
+        +'<span style="font-size:12px;color:rgba(255,255,255,.5)">'+t.count+' pickups &nbsp;|&nbsp; '+fmt(t.grand_total)+'</span></div>'
+      +(shiftBar?'<div class="report-shift-bar">'+shiftBar+'</div>':'')
+      +'<table class="report-table"><thead><tr>'
+        +'<th>Time</th><th>From</th><th>To</th><th>Customer</th>'
+        +'<th>Meter</th><th>Pay</th><th>Tip</th><th>Total</th>'
+      +'</tr></thead><tbody>'+rows+expRows+'</tbody></table>'
+      +'<div class="report-day-foot">'
+        +'<span>Cash: '+fmt(t.meter_cash)+'</span>'
+        +'<span>Credit: '+fmt(t.meter_credit)+'</span>'
+        +'<span>Voucher: '+fmt(t.meter_voucher)+'</span>'
+        +'<span>Tips: '+fmt(t.tip_cash+t.tip_credit+t.tip_voucher)+'</span>'
+        +(t.expense_total>0?'<span style="color:var(--red)">Expenses: −'+fmt(t.expense_total)+'</span>':'')
+        +'<strong>Owed: '+fmt(t.owed_driver)+'</strong>'
+        +(t.expense_total>0?'<strong class="report-net">Net: '+fmt(t.net_earnings)+'</strong>':'')
+      +'</div>'
+    +'</div>';
+  }).join('');
+  const s=data.summary;
+  const summaryItems=[
+    ['Pickups',s.count,false],['Cash Meter',fmt(s.meter_cash),false],
+    ['Credit Meter',fmt(s.meter_credit),false],['Voucher Meter',fmt(s.meter_voucher),false],
+    ['Credit Tips',fmt(s.tip_credit),false],['Voucher Tips',fmt(s.tip_voucher),false],
+    ['Grand Total',fmt(s.grand_total),false],['Total Expenses',fmt(s.expense_total||0),false],
+    ['Owed Driver',fmt(s.owed_driver),true],['Net Earnings',fmt(s.net_earnings||s.owed_driver),'net'],
+  ];
+  out.innerHTML=dayBlocks
+    +'<div class="report-summary"><h3>Summary — '+modeLabel+'</h3><div class="summary-grid">'
+    +summaryItems.map(([l,v,cls])=>
+      '<div class="summary-item"><div class="summary-label">'+l+'</div>'
+      +'<div class="summary-val'+(cls==='net'?' summary-net':cls?' summary-owed':'')+'">'
+      +v+'</div></div>'
+    ).join('')
+    +'</div></div>';
+}
+
+function downloadReportCSV(){
+  const from=document.getElementById('rptFrom').value;
+  const to=document.getElementById('rptTo').value;
+  const p=[];
+  if(from)p.push('from_date='+from);
+  if(to)p.push('to_date='+to);
+  window.location.href='/api/report/csv'+(p.length?'?'+p.join('&'):'');
+}
+
+function downloadReportPDF(){
+  const from=document.getElementById('rptFrom').value;
+  const to=document.getElementById('rptTo').value;
+  const p=[];
+  if(from)p.push('from_date='+from);
+  if(to)p.push('to_date='+to);
+  window.location.href='/api/report-pdf'+(p.length?'?'+p.join('&'):'');
+}
+
+/* --- Restore --- */
+async function restoreFile(type){
+  const inputId='restore'+type.charAt(0).toUpperCase()+type.slice(1);
+  const input=document.getElementById(inputId);
+  if(!input?.files?.length){showToast('Please select a JSON file first');return}
+  if(!confirm('Restore '+type+'? This will overwrite current data.'))return;
+  const form=new FormData();form.append('file',input.files[0]);
+  const r=await fetch('/api/restore/'+type,{method:'POST',body:form});
+  if(r.ok){
+    showToast(type+' restored successfully');
+    if(type==='pickups')loadDailyLog();
+    if(type==='profile')window.location.reload();
+  }else{
+    const err=await r.json().catch(()=>({}));
+    showToast(err.detail||'Restore failed');
+  }
+}
+"""
+
+# ── write assets to disk (always refresh) ───────────────────────
 _ASSETS = {
     "templates/base.html":  BASE_HTML,
     "templates/index.html": INDEX_HTML,
@@ -440,14 +1136,12 @@ _ASSETS = {
 for _rel, _content in _ASSETS.items():
     _p = BASE_DIR / _rel
     _p.parent.mkdir(parents=True, exist_ok=True)
-    if not _p.exists():
-        _p.write_text(_content, encoding="utf-8")
-        print(f"[taxi-log] wrote {_rel}")
+    _p.write_text(_content, encoding="utf-8")
+
 # ════════════════════════════════════════════════════════════════
-# CHUNK 5 of 5  —  paste immediately after chunk 4
+# HELPERS
 # ════════════════════════════════════════════════════════════════
 
-# ── helpers ─────────────────────────────────────────────────────
 def _read(path: Path):
     if not path.exists(): return []
     with open(path) as f: return json.load(f)
@@ -459,23 +1153,42 @@ def _read_profile():
     if not PROFILE_F.exists(): return {}
     with open(PROFILE_F) as f: return json.load(f)
 
-# ── app setup ────────────────────────────────────────────────────
-TEMPLATES_DIR = (BASE_DIR / "templates").resolve()
-STATIC_DIR    = (BASE_DIR / "static").resolve()
+def owed_driver_amount(t: dict, profile: dict) -> float:
+    mode = (profile or {}).get("pay_mode", "standard")
+    mc, mcr, mv = t["meter_cash"], t["meter_credit"], t["meter_voucher"]
+    tc, tcr, tv = t["tip_cash"], t["tip_credit"], t["tip_voucher"]
+    gt = t["grand_total"]
+    if mode == "gate":
+        return round(gt - float((profile or {}).get("gate_fee") or 0), 2)
+    elif mode == "commission":
+        pct = float((profile or {}).get("company_pct") or 50) / 100
+        all_meter = mc + mcr + mv
+        all_tips  = tc + tcr + tv
+        return round(all_meter * (1 - pct) + all_tips, 2)
+    elif mode == "owner":
+        return round(gt, 2)
+    else:  # standard
+        return round(((mcr + mv) - mc) / 2 + tcr + tv, 2)
 
-app = FastAPI(title="Taxi Pickup Daily Log")
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
-
-# ── version-adaptive template helper ────────────────────────────
-import inspect as _inspect
-
-def _tmpl(name, request, ctx):
-    params = list(_inspect.signature(templates.TemplateResponse).parameters)
-    if params[0] == "self": params = params[1:]
-    if params[0] == "request":
-        return templates.TemplateResponse(request, name, ctx)
-    return templates.TemplateResponse(name, {"request": request, **ctx})
+def day_totals(recs, profile=None):
+    t = {"meter_cash":0,"meter_credit":0,"meter_voucher":0,
+         "tip_cash":0,"tip_credit":0,"tip_voucher":0,"grand_total":0,"count":0}
+    for r in recs:
+        pm  = (r.get("payment_method")     or "").lower()
+        tpm = (r.get("tip_payment_method") or "").lower()
+        m   = float(r.get("meter_total") or 0)
+        tip = float(r.get("tip") or 0)
+        if   pm  == "cash":    t["meter_cash"]    += m
+        elif pm  == "credit":  t["meter_credit"]  += m
+        elif pm  == "voucher": t["meter_voucher"]  += m
+        if   tpm == "cash":    t["tip_cash"]       += tip
+        elif tpm == "credit":  t["tip_credit"]     += tip
+        elif tpm == "voucher": t["tip_voucher"]    += tip
+        t["grand_total"] += float(r.get("calculated_total") or 0)
+        t["count"] += 1
+    result = {k: (round(v, 2) if k != "count" else v) for k, v in t.items()}
+    result["owed_driver"] = owed_driver_amount(result, profile)
+    return result
 
 def calc_total(meter: float, tip: float) -> float:
     return round((meter or 0) + (tip or 0), 2)
@@ -496,7 +1209,28 @@ def upsert_customer(name, address, city, phone):
                           "street_address": address or "", "city": city or "", "phone": phone or ""})
     _write(CUSTOMERS_F, customers)
 
+# ════════════════════════════════════════════════════════════════
+# APP
+# ════════════════════════════════════════════════════════════════
+
+TEMPLATES_DIR = (BASE_DIR / "templates").resolve()
+STATIC_DIR    = (BASE_DIR / "static").resolve()
+
+app = FastAPI(title="Taxi Pickup Daily Log")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+
+import inspect as _inspect
+
+def _tmpl(name, request, ctx):
+    params = list(_inspect.signature(templates.TemplateResponse).parameters)
+    if params[0] == "self": params = params[1:]
+    if params[0] == "request":
+        return templates.TemplateResponse(request, name, ctx)
+    return templates.TemplateResponse(name, {"request": request, **ctx})
+
 # ── pages ────────────────────────────────────────────────────────
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     profile = _read_profile()
@@ -508,12 +1242,25 @@ async def setup_page(request: Request):
     return _tmpl("setup.html", request, {"profile": _read_profile()})
 
 @app.post("/setup")
-async def save_profile(request: Request, driver_name: str = Form(...),
-                       vehicle: str = Form(""), phone: str = Form("")):
-    _write(PROFILE_F, {"driver_name": driver_name, "vehicle": vehicle, "phone": phone})
+async def save_profile(request: Request,
+                       driver_name:  str = Form(...),
+                       vehicle:      str = Form(""),
+                       phone:        str = Form(""),
+                       pay_mode:     str = Form("standard"),
+                       gate_fee:     str = Form(""),
+                       company_pct:  str = Form("")):
+    _write(PROFILE_F, {
+        "driver_name": driver_name,
+        "vehicle":     vehicle,
+        "phone":       phone,
+        "pay_mode":    pay_mode,
+        "gate_fee":    float(gate_fee)    if gate_fee    else None,
+        "company_pct": float(company_pct) if company_pct else None,
+    })
     return RedirectResponse("/", status_code=303)
 
-# ── pickups API ──────────────────────────────────────────────────
+# ── pickups ──────────────────────────────────────────────────────
+
 @app.get("/api/pickups")
 async def get_pickups(date: Optional[str] = None):
     pickups = _read(PICKUPS_F)
@@ -524,13 +1271,20 @@ async def get_pickups(date: Optional[str] = None):
 async def create_pickup(request: Request):
     body = await request.json()
     m, t = float(body.get("meter_total") or 0), float(body.get("tip") or 0)
-    record = {"id": str(uuid.uuid4()), "pickup_date": body.get("pickup_date",""),
-              "pickup_time": body.get("pickup_time",""), "street_address": body.get("street_address",""),
-              "city": body.get("city",""), "customer_name": body.get("customer_name",""),
-              "phone_number": body.get("phone_number",""), "destination_address": body.get("destination_address",""),
-              "meter_total": m, "payment_method": body.get("payment_method",""),
-              "tip": t, "tip_payment_method": body.get("tip_payment_method",""),
-              "calculated_total": calc_total(m, t), "created_at": datetime.utcnow().isoformat()}
+    record = {
+        "id": str(uuid.uuid4()),
+        "pickup_date": body.get("pickup_date",""),
+        "pickup_time": body.get("pickup_time",""),
+        "street_address": body.get("street_address",""),
+        "city": body.get("city",""),
+        "customer_name": body.get("customer_name",""),
+        "phone_number": body.get("phone_number",""),
+        "destination_address": body.get("destination_address",""),
+        "meter_total": m, "payment_method": body.get("payment_method",""),
+        "tip": t, "tip_payment_method": body.get("tip_payment_method",""),
+        "calculated_total": calc_total(m, t),
+        "created_at": datetime.utcnow().isoformat(),
+    }
     pickups = _read(PICKUPS_F); pickups.append(record); _write(PICKUPS_F, pickups)
     upsert_customer(record["customer_name"], record["street_address"], record["city"], record["phone_number"])
     return record
@@ -550,9 +1304,9 @@ async def update_pickup(pid: str, request: Request):
     for k in ["pickup_date","pickup_time","street_address","city","customer_name",
               "phone_number","destination_address","meter_total","payment_method","tip","tip_payment_method"]:
         if k in body: rec[k] = body[k]
-    rec["meter_total"] = float(rec.get("meter_total") or 0)
-    rec["tip"]         = float(rec.get("tip") or 0)
-    rec["calculated_total"] = calc_total(rec["meter_total"], rec["tip"])
+    rec["meter_total"]       = float(rec.get("meter_total") or 0)
+    rec["tip"]               = float(rec.get("tip") or 0)
+    rec["calculated_total"]  = calc_total(rec["meter_total"], rec["tip"])
     pickups[idx] = rec; _write(PICKUPS_F, pickups)
     upsert_customer(rec["customer_name"], rec["street_address"], rec["city"], rec["phone_number"])
     return rec
@@ -567,36 +1321,300 @@ async def delete_pickup(pid: str):
 async def delete_all():
     _write(PICKUPS_F, []); _write(CUSTOMERS_F, []); return {"ok": True}
 
+# ── expenses ─────────────────────────────────────────────────────
+
+@app.get("/api/expenses")
+async def get_expenses(date: Optional[str] = None):
+    expenses = _read(EXPENSES_F)
+    if date: expenses = [e for e in expenses if e.get("date") == date]
+    return sorted(expenses, key=lambda e: e.get("date",""))
+
+@app.post("/api/expenses")
+async def create_expense(request: Request):
+    body = await request.json()
+    record = {
+        "id": str(uuid.uuid4()),
+        "date": body.get("date",""),
+        "category": body.get("category",""),
+        "amount": float(body.get("amount") or 0),
+        "notes": body.get("notes",""),
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    expenses = _read(EXPENSES_F); expenses.append(record); _write(EXPENSES_F, expenses)
+    return record
+
+@app.delete("/api/expenses/{eid}")
+async def delete_expense(eid: str):
+    expenses = _read(EXPENSES_F)
+    if not any(e["id"] == eid for e in expenses): raise HTTPException(404, "Not found")
+    _write(EXPENSES_F, [e for e in expenses if e["id"] != eid]); return {"ok": True}
+
+# ── shifts ───────────────────────────────────────────────────────
+
+@app.get("/api/shifts")
+async def get_shifts(date: Optional[str] = None):
+    shifts = _read(SHIFTS_F)
+    if date: shifts = [s for s in shifts if s.get("date") == date]
+    return shifts
+
+@app.post("/api/shifts")
+async def save_shift(request: Request):
+    body   = await request.json()
+    shifts = _read(SHIFTS_F)
+    d      = body.get("date","")
+    existing = next((s for s in shifts if s.get("date") == d), None)
+    odo_start = float(body.get("odometer_start") or 0)
+    odo_end   = float(body.get("odometer_end")   or 0)
+    miles     = round(max(odo_end - odo_start, 0), 1)
+    if existing:
+        existing.update({
+            "start_time":    body.get("start_time",""),
+            "end_time":      body.get("end_time",""),
+            "odometer_start": odo_start,
+            "odometer_end":   odo_end,
+            "miles":          miles,
+            "notes":          body.get("notes",""),
+        })
+        _write(SHIFTS_F, shifts)
+        return existing
+    record = {
+        "id": str(uuid.uuid4()), "date": d,
+        "start_time":    body.get("start_time",""),
+        "end_time":      body.get("end_time",""),
+        "odometer_start": odo_start, "odometer_end": odo_end, "miles": miles,
+        "notes":          body.get("notes",""),
+        "created_at":     datetime.utcnow().isoformat(),
+    }
+    shifts.append(record); _write(SHIFTS_F, shifts)
+    return record
+
+# ── daily totals (server-side, payment-mode aware) ───────────────
+
+@app.get("/api/daily-totals")
+async def daily_totals_api(date: Optional[str] = None):
+    profile  = _read_profile()
+    pickups  = _read(PICKUPS_F)
+    expenses = _read(EXPENSES_F)
+    if date:
+        pickups  = [p for p in pickups  if p.get("pickup_date") == date]
+        expenses = [e for e in expenses if e.get("date")        == date]
+    totals = day_totals(pickups, profile)
+    exp_total = round(sum(e["amount"] for e in expenses), 2)
+    totals["expense_total"] = exp_total
+    totals["net_earnings"]  = round(totals["owed_driver"] - exp_total, 2)
+    totals["pay_mode"]      = profile.get("pay_mode", "standard")
+    return totals
+
 # ── report ───────────────────────────────────────────────────────
-def day_totals(recs):
-    t = {"meter_cash":0,"meter_credit":0,"meter_voucher":0,
-         "tip_cash":0,"tip_credit":0,"tip_voucher":0,"grand_total":0,"count":0}
-    for r in recs:
-        pm = (r.get("payment_method") or "").lower()
-        tpm= (r.get("tip_payment_method") or "").lower()
-        m  = float(r.get("meter_total") or 0); tip = float(r.get("tip") or 0)
-        if pm=="cash":    t["meter_cash"]   +=m
-        elif pm=="credit": t["meter_credit"] +=m
-        elif pm=="voucher":t["meter_voucher"]+=m
-        if tpm=="cash":    t["tip_cash"]   +=tip
-        elif tpm=="credit": t["tip_credit"] +=tip
-        elif tpm=="voucher":t["tip_voucher"]+=tip
-        t["grand_total"]+=float(r.get("calculated_total") or 0); t["count"]+=1
-    t["owed_driver"]=round(((t["meter_credit"]+t["meter_voucher"])-t["meter_cash"])/2+t["tip_credit"]+t["tip_voucher"],2)
-    return {k:(round(v,2) if k!="count" else v) for k,v in t.items()}
 
 @app.get("/api/report")
 async def report(from_date: str = "", to_date: str = ""):
+    profile      = _read_profile()
+    pickups      = _read(PICKUPS_F)
+    expenses_all = _read(EXPENSES_F)
+    shifts_all   = _read(SHIFTS_F)
+
+    if from_date:
+        pickups      = [p for p in pickups      if p.get("pickup_date","") >= from_date]
+        expenses_all = [e for e in expenses_all if e.get("date","")        >= from_date]
+    if to_date:
+        pickups      = [p for p in pickups      if p.get("pickup_date","") <= to_date]
+        expenses_all = [e for e in expenses_all if e.get("date","")        <= to_date]
+
+    all_dates = set(p.get("pickup_date","") for p in pickups) | set(e.get("date","") for e in expenses_all)
+    pickup_map  = {}
+    for p in pickups: pickup_map.setdefault(p.get("pickup_date",""), []).append(p)
+    expense_map = {}
+    for e in expenses_all: expense_map.setdefault(e.get("date",""), []).append(e)
+    shift_map = {s["date"]: s for s in shifts_all}
+
+    days = []
+    for d in sorted(all_dates):
+        day_p  = sorted(pickup_map.get(d, []),  key=lambda x: x.get("pickup_time",""))
+        day_e  = expense_map.get(d, [])
+        totals = day_totals(day_p, profile)
+        exp_total = round(sum(e["amount"] for e in day_e), 2)
+        totals["expense_total"] = exp_total
+        totals["net_earnings"]  = round(totals["owed_driver"] - exp_total, 2)
+        days.append({"date": d, "pickups": day_p, "expenses": day_e,
+                     "shift": shift_map.get(d), "totals": totals})
+
+    summary = day_totals(pickups, profile)
+    total_exp = round(sum(e["amount"] for e in expenses_all), 2)
+    summary["expense_total"] = total_exp
+    summary["net_earnings"]  = round(summary["owed_driver"] - total_exp, 2)
+    summary["pay_mode"]      = profile.get("pay_mode", "standard")
+    return {"days": days, "summary": summary}
+
+# ── CSV export ───────────────────────────────────────────────────
+
+@app.get("/api/report/csv")
+async def report_csv(from_date: str = "", to_date: str = ""):
     pickups = _read(PICKUPS_F)
     if from_date: pickups = [p for p in pickups if p.get("pickup_date","") >= from_date]
     if to_date:   pickups = [p for p in pickups if p.get("pickup_date","") <= to_date]
-    days_map = {}
-    for p in pickups: days_map.setdefault(p.get("pickup_date",""), []).append(p)
-    days = [{"date": d, "pickups": sorted(days_map[d], key=lambda x: x.get("pickup_time","")),
-             "totals": day_totals(days_map[d])} for d in sorted(days_map)]
-    return {"days": days, "summary": day_totals(pickups)}
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Date","Time","Street Address","City","Customer","Phone",
+                "Destination","Meter","Payment","Tip","Tip Payment","Total"])
+    for p in sorted(pickups, key=lambda x: (x.get("pickup_date",""), x.get("pickup_time",""))):
+        w.writerow([p.get("pickup_date",""), p.get("pickup_time",""),
+                    p.get("street_address",""), p.get("city",""),
+                    p.get("customer_name",""), p.get("phone_number",""),
+                    p.get("destination_address",""), p.get("meter_total",0),
+                    p.get("payment_method",""), p.get("tip",0),
+                    p.get("tip_payment_method",""), p.get("calculated_total",0)])
+    fname = f"taxilog_{from_date or 'all'}_to_{to_date or 'all'}.csv"
+    return StreamingResponse(io.BytesIO(buf.getvalue().encode()),
+                             media_type="text/csv",
+                             headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+# ── PDF report ───────────────────────────────────────────────────
+
+@app.get("/api/report-pdf")
+async def report_pdf(from_date: str = "", to_date: str = ""):
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+    from reportlab.lib import colors
+
+    profile  = _read_profile()
+    driver   = profile.get("driver_name", "Unknown Driver")
+    pay_mode = profile.get("pay_mode", "standard")
+    mode_labels = {"standard":"Standard Split","gate":"Flat Gate Fee",
+                   "commission":"Commission Split","owner":"Owner-Operator"}
+
+    pickups      = _read(PICKUPS_F)
+    expenses_all = _read(EXPENSES_F)
+    if from_date:
+        pickups      = [p for p in pickups      if p.get("pickup_date","") >= from_date]
+        expenses_all = [e for e in expenses_all if e.get("date","")        >= from_date]
+    if to_date:
+        pickups      = [p for p in pickups      if p.get("pickup_date","") <= to_date]
+        expenses_all = [e for e in expenses_all if e.get("date","")        <= to_date]
+
+    pickup_map  = {}
+    for p in pickups: pickup_map.setdefault(p.get("pickup_date",""), []).append(p)
+    expense_map = {}
+    for e in expenses_all: expense_map.setdefault(e.get("date",""), []).append(e)
+    all_dates = sorted(set(pickup_map) | set(expense_map))
+
+    buf  = io.BytesIO()
+    doc  = SimpleDocTemplate(buf, pagesize=letter,
+                             leftMargin=0.75*inch, rightMargin=0.75*inch,
+                             topMargin=0.75*inch,  bottomMargin=0.75*inch)
+    styles = getSampleStyleSheet()
+    amber  = colors.HexColor("#D97706")
+    dark   = colors.HexColor("#1C1917")
+    red    = colors.HexColor("#EF4444")
+    green  = colors.HexColor("#10B981")
+    h1  = ParagraphStyle("h1",  parent=styles["Heading1"], textColor=amber, fontSize=18, spaceAfter=2)
+    h2  = ParagraphStyle("h2",  parent=styles["Heading2"], textColor=dark,  fontSize=12, spaceBefore=10, spaceAfter=4)
+    h3  = ParagraphStyle("h3",  parent=styles["Heading3"], textColor=dark,  fontSize=10, spaceBefore=6,  spaceAfter=2)
+    body= styles["BodyText"]
+
+    date_range = f"{from_date or 'all'} to {to_date or 'all'}"
+    story = [
+        Paragraph("Taxi Pickup Daily Log — Earnings Report", h1),
+        Paragraph(f"Driver: {driver} &nbsp;|&nbsp; Payment Mode: {mode_labels.get(pay_mode,'Standard')} &nbsp;|&nbsp; Period: {date_range}", body),
+        Paragraph(f"Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}", body),
+        HRFlowable(width="100%", color=amber, thickness=2, spaceAfter=8),
+    ]
+
+    col_w = [0.7*inch, 1.3*inch, 1.3*inch, 0.9*inch, 0.7*inch, 0.7*inch, 0.7*inch, 0.7*inch]
+    hdr_style = [
+        ("BACKGROUND", (0,0), (-1,0), amber),
+        ("TEXTCOLOR",  (0,0), (-1,0), colors.white),
+        ("FONTNAME",   (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE",   (0,0), (-1,-1), 7),
+        ("TOPPADDING", (0,0), (-1,-1), 3),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#FFFBEB")]),
+        ("GRID", (0,0), (-1,-1), 0.4, colors.HexColor("#D1D5DB")),
+    ]
+
+    grand_totals = {"meter":0,"tips":0,"gross":0,"expenses":0,"owed":0,"net":0,"count":0}
+
+    for d in all_dates:
+        day_p = sorted(pickup_map.get(d, []), key=lambda x: x.get("pickup_time",""))
+        day_e = expense_map.get(d, [])
+        totals= day_totals(day_p, profile)
+        exp_total = round(sum(e["amount"] for e in day_e), 2)
+        net = round(totals["owed_driver"] - exp_total, 2)
+
+        story.append(Paragraph(f"{d}  —  {totals['count']} pickups  |  Gross: ${totals['grand_total']:.2f}  |  Owed: ${totals['owed_driver']:.2f}  |  Net: ${net:.2f}", h2))
+
+        rows = [["Time","From","To","Customer","Meter","Pay","Tip","Total"]]
+        for p in day_p:
+            rows.append([
+                p.get("pickup_time",""),
+                (p.get("street_address","")[:18]+"…" if len(p.get("street_address",""))>18 else p.get("street_address","")),
+                (p.get("destination_address","")[:18]+"…" if len(p.get("destination_address",""))>18 else p.get("destination_address","")),
+                (p.get("customer_name","") or "—")[:14],
+                f"${p.get('meter_total',0):.2f}", p.get("payment_method","—"),
+                f"${p.get('tip',0):.2f}", f"${p.get('calculated_total',0):.2f}",
+            ])
+        tbl = Table(rows, colWidths=col_w)
+        tbl.setStyle(TableStyle(hdr_style))
+        story.append(tbl)
+
+        if day_e:
+            story.append(Paragraph("Expenses", h3))
+            exp_rows = [["Category","Notes","Amount"]]
+            for e in day_e:
+                exp_rows.append([e.get("category",""), e.get("notes",""), f"${e['amount']:.2f}"])
+            exp_rows.append(["","Total",f"${exp_total:.2f}"])
+            et = Table(exp_rows, colWidths=[1.5*inch, 3.5*inch, 1.0*inch])
+            et.setStyle(TableStyle([
+                ("BACKGROUND",(0,0),(-1,0), red),
+                ("TEXTCOLOR",(0,0),(-1,0), colors.white),
+                ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+                ("FONTNAME",(0,-1),(-1,-1),"Helvetica-Bold"),
+                ("FONTSIZE",(0,0),(-1,-1),7),
+                ("TOPPADDING",(0,0),(-1,-1),3),("BOTTOMPADDING",(0,0),(-1,-1),3),
+                ("GRID",(0,0),(-1,-1),0.4,colors.HexColor("#FECACA")),
+            ]))
+            story.append(et)
+
+        story.append(Spacer(1, 6))
+        grand_totals["meter"]    += totals["meter_cash"]+totals["meter_credit"]+totals["meter_voucher"]
+        grand_totals["tips"]     += totals["tip_cash"]+totals["tip_credit"]+totals["tip_voucher"]
+        grand_totals["gross"]    += totals["grand_total"]
+        grand_totals["expenses"] += exp_total
+        grand_totals["owed"]     += totals["owed_driver"]
+        grand_totals["net"]      += net
+        grand_totals["count"]    += totals["count"]
+
+    story.append(HRFlowable(width="100%", color=amber, thickness=2, spaceAfter=6))
+    story.append(Paragraph("Summary", h2))
+    sum_data = [
+        ["Total Pickups", str(grand_totals["count"])],
+        ["Total Meter",   f"${grand_totals['meter']:.2f}"],
+        ["Total Tips",    f"${grand_totals['tips']:.2f}"],
+        ["Gross Revenue", f"${grand_totals['gross']:.2f}"],
+        ["Total Expenses",f"${grand_totals['expenses']:.2f}"],
+        ["Total Owed Driver", f"${grand_totals['owed']:.2f}"],
+        ["Net Earnings",  f"${grand_totals['net']:.2f}"],
+    ]
+    st = Table(sum_data, colWidths=[2*inch, 1.5*inch])
+    st.setStyle(TableStyle([
+        ("FONTSIZE",(0,0),(-1,-1),9),
+        ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
+        ("ROWBACKGROUNDS",(0,0),(-1,-1),[colors.white, colors.HexColor("#FFFBEB")]),
+        ("GRID",(0,0),(-1,-1),0.5,colors.HexColor("#D1D5DB")),
+        ("FONTNAME",(0,-1),(-1,-1),"Helvetica-Bold"),
+        ("TEXTCOLOR",(0,-1),(-1,-1),green),
+    ]))
+    story.append(st)
+
+    doc.build(story); buf.seek(0)
+    label = f"{from_date or 'all'}_to_{to_date or 'all'}"
+    return StreamingResponse(buf, media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=earnings_report_{label}.pdf"})
 
 # ── customers ────────────────────────────────────────────────────
+
 @app.get("/api/customers/suggest")
 async def suggest(q: str = ""):
     if not q or len(q) < 2: return []
@@ -617,6 +1635,7 @@ async def lookup(phone: str = "", address: str = ""):
     return {}
 
 # ── backup / restore ─────────────────────────────────────────────
+
 @app.get("/api/backup/pickups")
 async def backup_pickups():
     if not PICKUPS_F.exists(): _write(PICKUPS_F, [])
@@ -626,6 +1645,16 @@ async def backup_pickups():
 async def backup_customers():
     if not CUSTOMERS_F.exists(): _write(CUSTOMERS_F, [])
     return FileResponse(CUSTOMERS_F, filename=f"customers_{date.today().isoformat()}.json", media_type="application/json")
+
+@app.get("/api/backup/expenses")
+async def backup_expenses():
+    if not EXPENSES_F.exists(): _write(EXPENSES_F, [])
+    return FileResponse(EXPENSES_F, filename=f"expenses_{date.today().isoformat()}.json", media_type="application/json")
+
+@app.get("/api/backup/shifts")
+async def backup_shifts():
+    if not SHIFTS_F.exists(): _write(SHIFTS_F, [])
+    return FileResponse(SHIFTS_F, filename=f"shifts_{date.today().isoformat()}.json", media_type="application/json")
 
 @app.get("/api/backup/profile")
 async def backup_profile():
@@ -645,10 +1674,17 @@ async def restore_pickups(file: UploadFile = File(...)): return await _restore(f
 @app.post("/api/restore/customers")
 async def restore_customers(file: UploadFile = File(...)): return await _restore(file, CUSTOMERS_F, True)
 
+@app.post("/api/restore/expenses")
+async def restore_expenses(file: UploadFile = File(...)): return await _restore(file, EXPENSES_F, True)
+
+@app.post("/api/restore/shifts")
+async def restore_shifts(file: UploadFile = File(...)): return await _restore(file, SHIFTS_F, True)
+
 @app.post("/api/restore/profile")
 async def restore_profile(file: UploadFile = File(...)): return await _restore(file, PROFILE_F, False)
 
-# ── requirements PDF ─────────────────────────────────────────────
+# ── requirements PDF (unchanged) ─────────────────────────────────
+
 @app.get("/api/requirements-pdf")
 async def requirements_pdf():
     from reportlab.lib.pagesizes import letter
@@ -656,14 +1692,12 @@ async def requirements_pdf():
     from reportlab.lib.units import inch
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
     from reportlab.lib import colors
-    from fastapi.responses import StreamingResponse
-    import io
     profile = _read_profile(); driver = profile.get("driver_name", "Unknown Driver")
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=letter, leftMargin=inch, rightMargin=inch, topMargin=inch, bottomMargin=inch)
     styles = getSampleStyleSheet(); amber = colors.HexColor("#D97706"); dark = colors.HexColor("#1C1917")
     h1 = ParagraphStyle("h1", parent=styles["Heading1"], textColor=amber, fontSize=18, spaceAfter=4)
-    h2 = ParagraphStyle("h2", parent=styles["Heading2"], textColor=dark, fontSize=13, spaceBefore=12, spaceAfter=4)
+    h2 = ParagraphStyle("h2", parent=styles["Heading2"], textColor=dark,  fontSize=13, spaceBefore=12, spaceAfter=4)
     body = styles["BodyText"]
     story = [Paragraph("Taxi Pickup Daily Log", h1), Paragraph("Application Requirements Document", body),
              Paragraph(f"Driver: {driver} &nbsp;&nbsp; Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}", body),
@@ -673,20 +1707,23 @@ async def requirements_pdf():
              Spacer(1,6), Paragraph("2. Technical Stack", h2)]
     td = [["Component","Technology","Notes"],["Backend","FastAPI","Async Python"],["Templating","Jinja2","Server-side HTML"],
           ["Frontend","Vanilla JS","No framework"],["Styling","Custom CSS","Amber theme"],
-          ["Storage","JSON files","pickups/customers/profile"],["PDF","ReportLab","Server-side"],["Server","Uvicorn","ASGI"]]
+          ["Storage","JSON files","pickups/customers/profile/expenses/shifts"],["PDF","ReportLab","Server-side"],["Server","Uvicorn","ASGI"]]
     tbl = Table(td, colWidths=[1.5*inch, 1.5*inch, 3.5*inch])
     tbl.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),amber),("TEXTCOLOR",(0,0),(-1,0),colors.white),
         ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#FEF3C7")]),
         ("GRID",(0,0),(-1,-1),0.5,colors.HexColor("#D1D5DB")),("FONTSIZE",(0,0),(-1,-1),9),
         ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4)]))
-    story += [tbl, Spacer(1,6), Paragraph("3. Calculation Formulas", h2),
-              Paragraph("<b>Calculated Total</b> = Meter Total + Tip", body), Spacer(1,4),
-              Paragraph("<b>Owed Driver</b> = ((Credit + Voucher) − Cash) / 2 + Credit Tips + Voucher Tips", body)]
+    story += [tbl, Spacer(1,6), Paragraph("3. Payment Modes", h2),
+              Paragraph("<b>Standard:</b> ((Credit + Voucher) − Cash) / 2 + Credit Tips + Voucher Tips", body),
+              Paragraph("<b>Gate:</b> Grand Total − Daily Gate Fee", body),
+              Paragraph("<b>Commission:</b> Meter Total × Driver% + All Tips", body),
+              Paragraph("<b>Owner-Operator:</b> Grand Total (keep everything)", body)]
     doc.build(story); buf.seek(0)
     return StreamingResponse(buf, media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename=requirements_{date.today().isoformat()}.pdf"})
 
 # ── entry point ──────────────────────────────────────────────────
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
