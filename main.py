@@ -38,6 +38,7 @@ BASE_HTML = """<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{% block title %}Taxi Log{% endblock %}</title>
   <link rel="stylesheet" href="/static/css/style.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/clocklet@0.3.0/css/clocklet.min.css">
 </head>
 <body>
 <header class="site-header">
@@ -207,11 +208,11 @@ BASE_HTML = """<!DOCTYPE html>
         <div class="row-2">
           <div class="field-group">
             <label class="field-label">Start Time</label>
-            <input type="time" id="sh_start" class="field-input" oninput="calcShiftStats()">
+            <input type="text" id="sh_start" class="field-input" data-clocklet="format: hh:mm A;" placeholder="--:-- AM" oninput="calcShiftStats()" onchange="calcShiftStats()">
           </div>
           <div class="field-group">
             <label class="field-label">End Time</label>
-            <input type="time" id="sh_end" class="field-input" oninput="calcShiftStats()">
+            <input type="text" id="sh_end" class="field-input" data-clocklet="format: hh:mm A;" placeholder="--:-- AM" oninput="calcShiftStats()" onchange="calcShiftStats()">
           </div>
         </div>
         <div class="row-2">
@@ -241,6 +242,7 @@ BASE_HTML = """<!DOCTYPE html>
 
 <div id="toast" class="toast" style="display:none"></div>
 <script src="/static/js/app.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/clocklet@0.3.0"></script>
 {% block extra_js %}{% endblock %}
 </body>
 </html>
@@ -264,7 +266,7 @@ INDEX_HTML = """{% extends "base.html" %}
         </div>
         <div class="field-group">
           <label class="field-label">Time <span class="required">*</span></label>
-          <input type="time" id="pickup_time" name="pickup_time" class="field-input" required>
+          <input type="text" id="pickup_time" name="pickup_time" class="field-input" required data-clocklet="format: hh:mm A;" placeholder="--:-- AM">
         </div>
       </div>
       <div class="field-group autocomplete-wrap">
@@ -359,8 +361,8 @@ INDEX_HTML = """{% extends "base.html" %}
 <script>
   (function(){
     const d = new Date(); d.setMinutes(d.getMinutes()+20);
-    document.getElementById('pickup_time').value =
-      String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
+    const h24=String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
+    document.getElementById('pickup_time').value=to12h(h24);
   })();
   loadDailyLog();
 </script>
@@ -635,6 +637,31 @@ select.field-input{cursor:pointer}
 JS = """/* app.js */
 function fmt(v){return '$'+(parseFloat(v)||0).toFixed(2)}
 
+/* 12h ↔ 24h helpers for Clocklet */
+function to24h(t){
+  if(!t)return'';
+  const m=t.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if(!m)return t;
+  let h=parseInt(m[1]);const min=m[2],p=m[3].toUpperCase();
+  if(p==='PM'&&h!==12)h+=12;
+  if(p==='AM'&&h===12)h=0;
+  return String(h).padStart(2,'0')+':'+min;
+}
+function to12h(t){
+  if(!t)return'';
+  const parts=t.split(':');if(parts.length<2)return t;
+  let h=parseInt(parts[0]);const min=parts[1].slice(0,2);
+  const p=h>=12?'PM':'AM';
+  if(h>12)h-=12;if(h===0)h=12;
+  return String(h).padStart(2,'0')+':'+min+' '+p;
+}
+/* open Clocklet on dynamically-created time fields */
+document.addEventListener('focusin',e=>{
+  if(e.target.classList.contains('clocklet-field')&&typeof clocklet!=='undefined'){
+    clocklet.open(e.target,{format:'hh:mm A'});
+  }
+});
+
 function showToast(msg,d=2500){
   const t=document.getElementById('toast');
   t.textContent=msg;t.style.display='block';
@@ -723,7 +750,7 @@ async function submitPickup(e){
   e.preventDefault();
   const f=e.target;
   const data={
-    pickup_date:f.pickup_date.value,pickup_time:f.pickup_time.value,
+    pickup_date:f.pickup_date.value,pickup_time:to24h(f.pickup_time.value),
     street_address:f.street_address.value,city:f.city.value,
     customer_name:f.customer_name.value,phone_number:f.phone_number.value,
     destination_address:f.destination_address.value,
@@ -845,7 +872,7 @@ async function openEdit(id){
   body.innerHTML=
     '<div class="row-2">'
       +'<div class="field-group"><label class="field-label">Date</label><input type="date" id="e_date" class="field-input" value="'+p.pickup_date+'"></div>'
-      +'<div class="field-group"><label class="field-label">Time</label><input type="time" id="e_time" class="field-input" value="'+p.pickup_time+'"></div>'
+      +'<div class="field-group"><label class="field-label">Time</label><input type="text" id="e_time" class="field-input clocklet-field" placeholder="--:-- AM" value="'+to12h(p.pickup_time)+'"></div>'
     +'</div>'
     +'<div class="field-group"><label class="field-label">Street Address</label><input type="text" id="e_street" class="field-input" value="'+p.street_address+'"></div>'
     +'<div class="row-2">'
@@ -880,7 +907,7 @@ document.addEventListener('click',async e=>{
   const id=btn.dataset.id;
   const data={
     pickup_date:document.getElementById('e_date').value,
-    pickup_time:document.getElementById('e_time').value,
+    pickup_time:to24h(document.getElementById('e_time').value),
     street_address:document.getElementById('e_street').value,
     city:document.getElementById('e_city').value,
     customer_name:document.getElementById('e_name').value,
@@ -995,8 +1022,8 @@ async function loadShift(){
   const savedEl=document.getElementById('shiftSaved');
   if(shifts.length){
     const s=shifts[0];
-    setValue('sh_start',s.start_time||'');
-    setValue('sh_end',s.end_time||'');
+    setValue('sh_start',to12h(s.start_time||''));
+    setValue('sh_end',to12h(s.end_time||''));
     setValue('sh_odo_start',s.odometer_start>0?s.odometer_start:'');
     setValue('sh_odo_end',s.odometer_end>0?s.odometer_end:'');
     setValue('sh_notes',s.notes||'');
@@ -1015,8 +1042,8 @@ async function loadShift(){
 }
 
 function calcShiftStats(){
-  const s=document.getElementById('sh_start')?.value;
-  const e=document.getElementById('sh_end')?.value;
+  const s=to24h(document.getElementById('sh_start')?.value);
+  const e=to24h(document.getElementById('sh_end')?.value);
   const os=parseFloat(document.getElementById('sh_odo_start')?.value)||0;
   const oe=parseFloat(document.getElementById('sh_odo_end')?.value)||0;
   const bar=document.getElementById('shiftStatsBar');
@@ -1035,8 +1062,8 @@ async function submitShift(e){
   e.preventDefault();
   const data={
     date:document.getElementById('sh_date').value,
-    start_time:document.getElementById('sh_start').value,
-    end_time:document.getElementById('sh_end').value,
+    start_time:to24h(document.getElementById('sh_start').value),
+    end_time:to24h(document.getElementById('sh_end').value),
     odometer_start:document.getElementById('sh_odo_start').value||0,
     odometer_end:document.getElementById('sh_odo_end').value||0,
     notes:document.getElementById('sh_notes').value,
