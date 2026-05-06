@@ -52,16 +52,21 @@ BASE_HTML = """<!DOCTYPE html>
       </div>
     </div>
     {% if profile %}
-    <nav class="site-nav">
-      <a href="/" class="nav-link {% if request.url.path == '/' %}active{% endif %}">📋 Log</a>
-      <a href="#" onclick="openShiftModal()" class="nav-link">⏱ Shift</a>
-      <a href="#" onclick="openExpenseModal()" class="nav-link">💸 Expenses</a>
-      <a href="#" onclick="openModal('reportModal')" class="nav-link">📊 Report</a>
-      <a href="#" onclick="openModal('backupModal')" class="nav-link">💾 Backup</a>
-      <a href="/setup" class="nav-link {% if request.url.path == '/setup' %}active{% endif %}">⚙️ Setup</a>
-    </nav>
+    <button class="hamburger" id="hamburger" onclick="toggleNav()" aria-label="Menu">
+      <span></span><span></span><span></span>
+    </button>
     {% endif %}
   </div>
+  {% if profile %}
+  <nav class="site-nav" id="siteNav">
+    <a href="/" class="nav-link {% if request.url.path == '/' %}active{% endif %}" onclick="closeNav()">📋 Log</a>
+    <a href="#" class="nav-link" onclick="closeNav();openShiftModal()">⏱ Shift</a>
+    <a href="#" class="nav-link" onclick="closeNav();openExpenseModal()">💸 Expenses</a>
+    <a href="#" class="nav-link" onclick="closeNav();openModal('reportModal')">📊 Report</a>
+    <a href="#" class="nav-link" onclick="closeNav();openModal('backupModal')">💾 Backup</a>
+    <a href="/setup" class="nav-link {% if request.url.path == '/setup' %}active{% endif %}" onclick="closeNav()">⚙️ Setup</a>
+  </nav>
+  {% endif %}
 </header>
 <main class="site-main">{% block content %}{% endblock %}</main>
 
@@ -97,7 +102,11 @@ BASE_HTML = """<!DOCTYPE html>
       <button class="modal-close" onclick="closeModal('backupModal')">✕</button>
     </div>
     <div class="modal-body">
-      <div class="section-label">Download Backup</div>
+      <div class="section-label">Full Backup</div>
+      <div class="btn-group mb-4">
+        <a href="/api/backup/all" class="btn btn-primary btn-sm" download>⬇ Download Full Backup (ZIP)</a>
+      </div>
+      <div class="section-label">Individual File Backups</div>
       <div class="btn-group mb-4">
         <a href="/api/backup/pickups"   class="btn btn-secondary btn-sm" download>⬇ Pickups</a>
         <a href="/api/backup/customers" class="btn btn-secondary btn-sm" download>⬇ Customers</a>
@@ -106,7 +115,10 @@ BASE_HTML = """<!DOCTYPE html>
         <a href="/api/backup/profile"   class="btn btn-secondary btn-sm" download>⬇ Profile</a>
         <a href="/api/requirements-pdf" class="btn btn-secondary btn-sm" download>⬇ Requirements PDF</a>
       </div>
-      <div class="section-label">Restore from Backup</div>
+      <div class="section-label">Restore from Full Backup (ZIP)</div>
+      <div class="warning-text">⚠️ Restore overwrites ALL data and cannot be undone.</div>
+      <div class="restore-row"><span class="restore-label">Backup ZIP</span><input type="file" id="restoreZip" accept=".zip"><button class="btn btn-sm btn-warning" onclick="restoreFromZip()">Restore All</button></div>
+      <div class="section-label">Restore Individual Files</div>
       <div class="warning-text">⚠️ Restore overwrites existing data and cannot be undone.</div>
       <div class="restore-row"><span class="restore-label">Pickups</span><input type="file" id="restorePickups" accept=".json"><button class="btn btn-sm btn-warning" onclick="restoreFile('pickups')">Restore</button></div>
       <div class="restore-row"><span class="restore-label">Customers</span><input type="file" id="restoreCustomers" accept=".json"><button class="btn btn-sm btn-warning" onclick="restoreFile('customers')">Restore</button></div>
@@ -459,8 +471,15 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:14
 .taxi-icon{font-size:24px}
 .brand-title{color:#FFF;font-size:17px;font-weight:700;letter-spacing:-.3px}
 .brand-sub{color:rgba(255,255,255,.45);font-size:12px;margin-top:1px}
-.site-nav{display:flex;gap:2px}
-.nav-link{color:rgba(255,255,255,.6);text-decoration:none;padding:6px 14px;border-radius:var(--radius-sm);font-size:13px;font-weight:500;transition:all .15s;display:flex;align-items:center;gap:5px}
+.hamburger{background:none;border:none;cursor:pointer;padding:6px 8px;display:flex;flex-direction:column;gap:5px;border-radius:var(--radius-sm);transition:background .15s}
+.hamburger:hover{background:rgba(255,255,255,.08)}
+.hamburger span{display:block;width:22px;height:2px;background:#fff;border-radius:2px;transition:transform .25s,opacity .25s}
+.hamburger.open span:nth-child(1){transform:translateY(7px) rotate(45deg)}
+.hamburger.open span:nth-child(2){opacity:0}
+.hamburger.open span:nth-child(3){transform:translateY(-7px) rotate(-45deg)}
+.site-nav{display:none;flex-direction:column;background:#1C1917;border-top:1px solid rgba(255,255,255,.08);padding:8px 24px 12px}
+.site-nav.open{display:flex}
+.nav-link{color:rgba(255,255,255,.7);text-decoration:none;padding:10px 14px;border-radius:var(--radius-sm);font-size:14px;font-weight:500;transition:all .15s;display:flex;align-items:center;gap:8px}
 .nav-link:hover{color:#fff;background:rgba(255,255,255,.08)}
 .nav-link.active{color:var(--amber);background:rgba(245,158,11,.12)}
 .site-main{max-width:1280px;margin:0 auto;padding:24px}
@@ -620,6 +639,26 @@ function openModal(id){document.getElementById(id).style.display='flex'}
 function closeModal(id){document.getElementById(id).style.display='none'}
 document.querySelectorAll('.modal-overlay').forEach(el=>{
   el.addEventListener('click',e=>{if(e.target===el)el.style.display='none'});
+});
+
+function toggleNav(){
+  const nav=document.getElementById('siteNav');
+  const btn=document.getElementById('hamburger');
+  if(!nav)return;
+  nav.classList.toggle('open');
+  if(btn)btn.classList.toggle('open');
+}
+function closeNav(){
+  const nav=document.getElementById('siteNav');
+  const btn=document.getElementById('hamburger');
+  if(nav)nav.classList.remove('open');
+  if(btn)btn.classList.remove('open');
+}
+document.addEventListener('click',e=>{
+  const nav=document.getElementById('siteNav');
+  const btn=document.getElementById('hamburger');
+  if(!nav||!btn)return;
+  if(!nav.contains(e.target)&&!btn.contains(e.target))closeNav();
 });
 
 function updateCalcTotal(){
@@ -959,6 +998,13 @@ async function loadShift(){
     calcShiftStats();
     renderShiftSaved(s);
   }else{
+    setValue('sh_start','');
+    setValue('sh_end','');
+    setValue('sh_odo_start','');
+    setValue('sh_odo_end','');
+    setValue('sh_notes','');
+    const bar=document.getElementById('shiftStatsBar');
+    if(bar)bar.style.display='none';
     if(savedEl)savedEl.style.display='none';
   }
 }
@@ -1110,6 +1156,23 @@ function downloadReportPDF(){
 }
 
 /* --- Restore --- */
+async function restoreFromZip(){
+  const input=document.getElementById('restoreZip');
+  if(!input?.files?.length){showToast('Please select a ZIP backup file');return}
+  if(!confirm('Restore all data from ZIP? This overwrites all existing data.'))return;
+  const form=new FormData();form.append('file',input.files[0]);
+  const r=await fetch('/api/restore/all',{method:'POST',body:form});
+  if(r.ok){
+    const d=await r.json();
+    showToast('Restored '+d.restored.length+' files successfully');
+    closeModal('backupModal');
+    loadDailyLog();
+  }else{
+    const err=await r.json().catch(()=>({}));
+    showToast(err.detail||'Restore failed');
+  }
+}
+
 async function restoreFile(type){
   const inputId='restore'+type.charAt(0).toUpperCase()+type.slice(1);
   const input=document.getElementById(inputId);
@@ -1687,6 +1750,33 @@ async def backup_profile():
     if not PROFILE_F.exists(): _write(PROFILE_F, {})
     return FileResponse(PROFILE_F, filename=f"profile_{date.today().isoformat()}.json", media_type="application/json")
 
+@app.get("/api/backup/all")
+async def backup_all():
+    import zipfile as zf_mod
+    files = [
+        (PICKUPS_F,   "pickups.json",   "[]"),
+        (CUSTOMERS_F, "customers.json", "[]"),
+        (EXPENSES_F,  "expenses.json",  "[]"),
+        (SHIFTS_F,    "shifts.json",    "[]"),
+        (PROFILE_F,   "profile.json",   "{}"),
+    ]
+    buf = io.BytesIO()
+    with zf_mod.ZipFile(buf, 'w', zf_mod.ZIP_DEFLATED) as zf:
+        for path, name, default in files:
+            if _GCS_BUCKET:
+                try:
+                    blob = _gcs_client().bucket(_GCS_BUCKET).blob(path.name)
+                    content = blob.download_as_text() if blob.exists() else default
+                except Exception:
+                    content = default
+            else:
+                content = path.read_text() if path.exists() else default
+            zf.writestr(name, content)
+    buf.seek(0)
+    fname = f"taxilog_backup_{date.today().isoformat()}.zip"
+    return StreamingResponse(buf, media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={fname}"})
+
 async def _restore(file: UploadFile, path: Path, expect_list: bool):
     try: data = json.loads(await file.read())
     except Exception: raise HTTPException(400, "Invalid JSON file")
@@ -1708,6 +1798,35 @@ async def restore_shifts(file: UploadFile = File(...)): return await _restore(fi
 
 @app.post("/api/restore/profile")
 async def restore_profile(file: UploadFile = File(...)): return await _restore(file, PROFILE_F, False)
+
+@app.post("/api/restore/all")
+async def restore_all(file: UploadFile = File(...)):
+    import zipfile as zf_mod
+    try:
+        data = await file.read()
+        with zf_mod.ZipFile(io.BytesIO(data)) as zf:
+            mapping = {
+                "pickups.json":   (PICKUPS_F,   True),
+                "customers.json": (CUSTOMERS_F, True),
+                "expenses.json":  (EXPENSES_F,  True),
+                "shifts.json":    (SHIFTS_F,    True),
+                "profile.json":   (PROFILE_F,   False),
+            }
+            restored = []
+            for name, (path, expect_list) in mapping.items():
+                if name in zf.namelist():
+                    parsed = json.loads(zf.read(name).decode())
+                    if expect_list and not isinstance(parsed, list):
+                        raise HTTPException(400, f"{name}: expected JSON array")
+                    if not expect_list and not isinstance(parsed, dict):
+                        raise HTTPException(400, f"{name}: expected JSON object")
+                    _write(path, parsed)
+                    restored.append(name)
+    except zf_mod.BadZipFile:
+        raise HTTPException(400, "Invalid ZIP file")
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON in backup file")
+    return {"ok": True, "restored": restored}
 
 # ── requirements PDF (unchanged) ─────────────────────────────────
 
