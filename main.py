@@ -103,9 +103,17 @@ BASE_HTML = """<!DOCTYPE html>
     </div>
     <div class="modal-body">
       <div class="section-label">Full Backup</div>
+      <p style="font-size:12px;color:var(--text3);margin-bottom:10px">Saves all data files as a single ZIP — you choose where.</p>
       <div class="btn-group mb-4">
-        <a href="/api/backup/all" class="btn btn-primary btn-sm" download>⬇ Download Full Backup (ZIP)</a>
+        <button class="btn btn-primary" onclick="saveFullBackup()">💾 Save Full Backup</button>
       </div>
+      <div class="section-label">Full Restore</div>
+      <div class="warning-text">⚠️ Restores ALL data from a backup ZIP. Cannot be undone.</div>
+      <div class="btn-group mb-4">
+        <button class="btn btn-warning" onclick="restoreFromZip()">📂 Select Backup &amp; Restore</button>
+      </div>
+      <input type="file" id="restoreZip" accept=".zip" style="display:none">
+      <hr class="divider">
       <div class="section-label">Individual File Backups</div>
       <div class="btn-group mb-4">
         <a href="/api/backup/pickups"   class="btn btn-secondary btn-sm" download>⬇ Pickups</a>
@@ -115,9 +123,6 @@ BASE_HTML = """<!DOCTYPE html>
         <a href="/api/backup/profile"   class="btn btn-secondary btn-sm" download>⬇ Profile</a>
         <a href="/api/requirements-pdf" class="btn btn-secondary btn-sm" download>⬇ Requirements PDF</a>
       </div>
-      <div class="section-label">Restore from Full Backup (ZIP)</div>
-      <div class="warning-text">⚠️ Restore overwrites ALL data and cannot be undone.</div>
-      <div class="restore-row"><span class="restore-label">Backup ZIP</span><input type="file" id="restoreZip" accept=".zip"><button class="btn btn-sm btn-warning" onclick="restoreFromZip()">Restore All</button></div>
       <div class="section-label">Restore Individual Files</div>
       <div class="warning-text">⚠️ Restore overwrites existing data and cannot be undone.</div>
       <div class="restore-row"><span class="restore-label">Pickups</span><input type="file" id="restorePickups" accept=".json"><button class="btn btn-sm btn-warning" onclick="restoreFile('pickups')">Restore</button></div>
@@ -1155,21 +1160,53 @@ function downloadReportPDF(){
   window.location.href='/api/report-pdf'+(p.length?'?'+p.join('&'):'');
 }
 
-/* --- Restore --- */
-async function restoreFromZip(){
-  const input=document.getElementById('restoreZip');
-  if(!input?.files?.length){showToast('Please select a ZIP backup file');return}
-  if(!confirm('Restore all data from ZIP? This overwrites all existing data.'))return;
-  const form=new FormData();form.append('file',input.files[0]);
-  const r=await fetch('/api/restore/all',{method:'POST',body:form});
-  if(r.ok){
-    const d=await r.json();
-    showToast('Restored '+d.restored.length+' files successfully');
-    closeModal('backupModal');
-    loadDailyLog();
+/* --- Full backup with Save As dialog --- */
+async function saveFullBackup(){
+  const fname='taxilog_backup_'+new Date().toISOString().slice(0,10)+'.zip';
+  if('showSaveFilePicker' in window){
+    try{
+      const handle=await window.showSaveFilePicker({
+        suggestedName:fname,
+        types:[{description:'ZIP Backup',accept:{'application/zip':['.zip']}}],
+      });
+      showToast('Saving…',60000);
+      const blob=await(await fetch('/api/backup/all')).blob();
+      const w=await handle.createWritable();
+      await w.write(blob);await w.close();
+      showToast('Backup saved');
+    }catch(e){if(e.name!=='AbortError')showToast('Save failed');}
   }else{
-    const err=await r.json().catch(()=>({}));
-    showToast(err.detail||'Restore failed');
+    const a=document.createElement('a');
+    a.href='/api/backup/all';a.download=fname;a.click();
+  }
+}
+
+/* --- Full restore with Open File dialog --- */
+async function restoreFromZip(){
+  const doRestore=async(file)=>{
+    if(!confirm('Restore all data from "'+file.name+'"?\\nThis overwrites all existing data and cannot be undone.'))return;
+    const form=new FormData();form.append('file',file);
+    const r=await fetch('/api/restore/all',{method:'POST',body:form});
+    if(r.ok){
+      const d=await r.json();
+      showToast('Restored '+d.restored.length+' files successfully');
+      closeModal('backupModal');loadDailyLog();
+    }else{
+      const err=await r.json().catch(()=>({}));
+      showToast(err.detail||'Restore failed');
+    }
+  };
+  if('showOpenFilePicker' in window){
+    try{
+      const [handle]=await window.showOpenFilePicker({
+        types:[{description:'ZIP Backup',accept:{'application/zip':['.zip']}}],
+      });
+      await doRestore(await handle.getFile());
+    }catch(e){if(e.name!=='AbortError')showToast('No file selected');}
+  }else{
+    const input=document.getElementById('restoreZip');
+    input.onchange=async()=>{if(input.files.length)await doRestore(input.files[0]);input.value='';};
+    input.click();
   }
 }
 
