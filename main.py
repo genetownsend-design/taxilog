@@ -38,7 +38,6 @@ BASE_HTML = """<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{% block title %}Taxi Log{% endblock %}</title>
   <link rel="stylesheet" href="/static/css/style.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/clocklet@0.3.0/css/clocklet.min.css">
 </head>
 <body>
 <header class="site-header">
@@ -208,11 +207,11 @@ BASE_HTML = """<!DOCTYPE html>
         <div class="row-2">
           <div class="field-group">
             <label class="field-label">Start Time</label>
-            <input type="text" id="sh_start" class="field-input" data-clocklet="format: hh:mm A;" placeholder="--:-- AM" oninput="calcShiftStats()" onchange="calcShiftStats()">
+            <input type="text" id="sh_start" class="field-input clk-input" placeholder="--:-- AM" readonly onclick="openClockPicker(this)">
           </div>
           <div class="field-group">
             <label class="field-label">End Time</label>
-            <input type="text" id="sh_end" class="field-input" data-clocklet="format: hh:mm A;" placeholder="--:-- AM" oninput="calcShiftStats()" onchange="calcShiftStats()">
+            <input type="text" id="sh_end" class="field-input clk-input" placeholder="--:-- AM" readonly onclick="openClockPicker(this)">
           </div>
         </div>
         <div class="row-2">
@@ -242,7 +241,6 @@ BASE_HTML = """<!DOCTYPE html>
 
 <div id="toast" class="toast" style="display:none"></div>
 <script src="/static/js/app.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/clocklet@0.3.0"></script>
 {% block extra_js %}{% endblock %}
 </body>
 </html>
@@ -266,7 +264,7 @@ INDEX_HTML = """{% extends "base.html" %}
         </div>
         <div class="field-group">
           <label class="field-label">Time <span class="required">*</span></label>
-          <input type="text" id="pickup_time" name="pickup_time" class="field-input" required data-clocklet="format: hh:mm A;" placeholder="--:-- AM">
+          <input type="text" id="pickup_time" name="pickup_time" class="field-input clk-input" required placeholder="--:-- AM" readonly onclick="openClockPicker(this)">
         </div>
       </div>
       <div class="field-group autocomplete-wrap">
@@ -628,6 +626,20 @@ select.field-input{cursor:pointer}
 .shift-saved-row:last-child{border-bottom:none}
 .shift-saved-row span{color:var(--text3)}
 .shift-saved-row strong{color:var(--text)}
+.clk-input{cursor:pointer;caret-color:transparent}
+#clk-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center}
+#clk-popup{background:#fff;border-radius:var(--radius-xl);padding:22px 20px 16px;width:250px;box-shadow:var(--shadow-lg);border:1px solid var(--border)}
+#clk-display{font-size:32px;font-weight:800;text-align:center;color:var(--text);letter-spacing:-1px;margin-bottom:14px;font-family:var(--font)}
+#clk-ampm{display:flex;gap:8px;justify-content:center;margin-bottom:14px}
+#clk-ampm button{flex:1;padding:8px;border:2px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-weight:700;cursor:pointer;background:#fff;color:var(--text2);transition:all .15s;font-family:var(--font)}
+#clk-ampm button.clk-active{background:var(--amber);border-color:var(--amber);color:#fff}
+#clk-face{position:relative;width:200px;height:200px;border-radius:50%;background:var(--surface2);border:2px solid var(--border);margin:0 auto 10px}
+.clk-num{position:absolute;width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12.5px;font-weight:600;cursor:pointer;color:var(--text2);transition:background .1s,color .1s;user-select:none}
+.clk-num:hover{background:var(--amber-lt);color:var(--amber-dd)}
+.clk-num.clk-sel{background:var(--amber);color:#fff}
+#clk-hint{text-align:center;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;font-weight:600;margin-bottom:12px}
+#clk-cancel{width:100%;padding:8px;border:1.5px solid var(--border);border-radius:var(--radius-sm);background:#fff;cursor:pointer;font-size:13px;color:var(--text2);font-family:var(--font);transition:background .15s}
+#clk-cancel:hover{background:var(--surface2)}
 """
 
 # ════════════════════════════════════════════════════════════════
@@ -655,12 +667,91 @@ function to12h(t){
   if(h>12)h-=12;if(h===0)h=12;
   return String(h).padStart(2,'0')+':'+min+' '+p;
 }
-/* open Clocklet on dynamically-created time fields */
-document.addEventListener('focusin',e=>{
-  if(e.target.classList.contains('clocklet-field')&&typeof clocklet!=='undefined'){
-    clocklet.open(e.target,{format:'hh:mm A'});
+/* ── Analogue Clock Picker ───────────────────────────────────── */
+(function(){
+  var HOURS=[12,1,2,3,4,5,6,7,8,9,10,11];
+  var MINS=[0,5,10,15,20,25,30,35,40,45,50,55];
+  var _inp=null,_mode='hour',_h=12,_m=0,_per='AM';
+
+  var ov=document.createElement('div');
+  ov.id='clk-overlay';ov.style.display='none';
+  ov.innerHTML='<div id="clk-popup">'
+    +'<div id="clk-display">12:00 AM</div>'
+    +'<div id="clk-ampm">'
+      +'<button id="clk-am" class="clk-active">AM</button>'
+      +'<button id="clk-pm">PM</button>'
+    +'</div>'
+    +'<div id="clk-face"></div>'
+    +'<div id="clk-hint">Select hour</div>'
+    +'<button id="clk-cancel">Cancel</button>'
+    +'</div>';
+  document.body.appendChild(ov);
+
+  function buildFace(items){
+    var face=ov.querySelector('#clk-face');face.innerHTML='';
+    var R=76;
+    items.forEach(function(val,i){
+      var ang=(i*30-90)*Math.PI/180;
+      var x=100+R*Math.cos(ang)-17;
+      var y=100+R*Math.sin(ang)-17;
+      var el=document.createElement('div');
+      var isSel=_mode==='hour'?val===_h:val===_m;
+      el.className='clk-num'+(isSel?' clk-sel':'');
+      el.style.left=x+'px';el.style.top=y+'px';
+      el.textContent=_mode==='minute'?String(val).padStart(2,'0'):String(val);
+      el.onclick=function(){pick(val);};
+      face.appendChild(el);
+    });
   }
-});
+
+  function updDisp(){
+    ov.querySelector('#clk-display').textContent=
+      String(_h).padStart(2,'0')+':'+String(_m).padStart(2,'0')+' '+_per;
+    ov.querySelector('#clk-am').className=_per==='AM'?'clk-active':'';
+    ov.querySelector('#clk-pm').className=_per==='PM'?'clk-active':'';
+  }
+
+  function pick(val){
+    if(_mode==='hour'){
+      _h=val;_mode='minute';
+      ov.querySelector('#clk-hint').textContent='Select minute';
+      buildFace(MINS);
+    }else{
+      _m=val;commit();
+    }
+    updDisp();
+  }
+
+  function commit(){
+    if(_inp){
+      _inp.value=String(_h).padStart(2,'0')+':'+String(_m).padStart(2,'0')+' '+_per;
+      _inp.dispatchEvent(new Event('input',{bubbles:true}));
+      _inp.dispatchEvent(new Event('change',{bubbles:true}));
+    }
+    close();
+  }
+
+  function close(){ov.style.display='none';_inp=null;}
+
+  window.openClockPicker=function(input){
+    _inp=input;_mode='hour';
+    var v=input.value;
+    var mt=v.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+    if(mt){
+      _h=parseInt(mt[1]);
+      _m=Math.round(parseInt(mt[2])/5)*5%60;
+      _per=mt[3].toUpperCase();
+    }else{_h=12;_m=0;_per='AM';}
+    ov.querySelector('#clk-hint').textContent='Select hour';
+    buildFace(HOURS);updDisp();
+    ov.style.display='flex';
+  };
+
+  ov.querySelector('#clk-am').onclick=function(){_per='AM';updDisp();};
+  ov.querySelector('#clk-pm').onclick=function(){_per='PM';updDisp();};
+  ov.querySelector('#clk-cancel').onclick=close;
+  ov.addEventListener('click',function(e){if(e.target===ov)close();});
+})();
 
 function showToast(msg,d=2500){
   const t=document.getElementById('toast');
@@ -872,7 +963,7 @@ async function openEdit(id){
   body.innerHTML=
     '<div class="row-2">'
       +'<div class="field-group"><label class="field-label">Date</label><input type="date" id="e_date" class="field-input" value="'+p.pickup_date+'"></div>'
-      +'<div class="field-group"><label class="field-label">Time</label><input type="text" id="e_time" class="field-input clocklet-field" placeholder="--:-- AM" value="'+to12h(p.pickup_time)+'"></div>'
+      +'<div class="field-group"><label class="field-label">Time</label><input type="text" id="e_time" class="field-input clk-input" placeholder="--:-- AM" readonly onclick="openClockPicker(this)" value="'+to12h(p.pickup_time)+'"></div>'
     +'</div>'
     +'<div class="field-group"><label class="field-label">Street Address</label><input type="text" id="e_street" class="field-input" value="'+p.street_address+'"></div>'
     +'<div class="row-2">'
@@ -1007,6 +1098,9 @@ async function deleteExpense(id){
 }
 
 /* --- Shift Modal --- */
+document.addEventListener('change',function(e){
+  if(e.target.id==='sh_start'||e.target.id==='sh_end')calcShiftStats();
+});
 function openShiftModal(){
   const d=document.getElementById('logDate');
   const shDate=document.getElementById('sh_date');
