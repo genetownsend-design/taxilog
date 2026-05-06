@@ -1,0 +1,10 @@
+data/
+__pycache__/
+*.pyc
+templates/
+static/
+*.py.bak
+main (1).py
+main (2).py
+chunk*.py
+.git/

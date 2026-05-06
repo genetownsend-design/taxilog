@@ -2,6 +2,7 @@ import uuid
 import json
 import csv
 import io
+import os
 from datetime import datetime, date
 from typing import Optional
 from pathlib import Path
@@ -758,13 +759,15 @@ function renderLog(pickups){
   }).join('');
 }
 
-/* Event delegation for edit/delete buttons */
+/* Event delegation for edit/delete/expense/cancel buttons */
 document.addEventListener('click',e=>{
   const btn=e.target.closest('[data-action]');
   if(!btn)return;
   const id=btn.dataset.id;
   if(btn.dataset.action==='edit')openEdit(id);
   if(btn.dataset.action==='delete')deletePickup(id);
+  if(btn.dataset.action==='del-expense')deleteExpense(id);
+  if(btn.dataset.action==='cancel-edit')closeModal('editModal');
 });
 
 function renderTotals(t){
@@ -818,7 +821,7 @@ async function openEdit(id){
     +'<div class="calc-total-bar"><span class="calc-total-label">Calculated Total</span><span id="e_calc" class="calc-total-value">'+fmt(p.calculated_total)+'</span></div>'
     +'<div class="btn-group mt-2">'
       +'<button class="btn btn-primary" data-action="save-edit" data-id="'+id+'">Save Changes</button>'
-      +'<button class="btn btn-ghost" onclick="closeModal(\'editModal\')">Cancel</button>'
+      +'<button class="btn btn-ghost" data-action="cancel-edit">Cancel</button>'
     +'</div>';
   openModal('editModal');
 }
@@ -900,7 +903,7 @@ function renderExpenses(expenses){
       +'</div>'
       +'<div class="expense-item-right">'
         +'<span class="expense-amt">'+fmt(e.amount)+'</span>'
-        +'<button class="btn btn-sm btn-danger" onclick="deleteExpense(\''+e.id+'\')">✕</button>'
+        +'<button class="btn btn-sm btn-danger" data-action="del-expense" data-id="'+e.id+'">✕</button>'
       +'</div>'
     +'</div>'
   ).join('');
@@ -1142,14 +1145,37 @@ for _rel, _content in _ASSETS.items():
 # HELPERS
 # ════════════════════════════════════════════════════════════════
 
+_GCS_BUCKET = os.environ.get("GCS_BUCKET")
+
+def _gcs_client():
+    from google.cloud import storage
+    return storage.Client()
+
 def _read(path: Path):
+    if _GCS_BUCKET:
+        try:
+            blob = _gcs_client().bucket(_GCS_BUCKET).blob(path.name)
+            if not blob.exists(): return []
+            return json.loads(blob.download_as_text())
+        except Exception: return []
     if not path.exists(): return []
     with open(path) as f: return json.load(f)
 
 def _write(path: Path, data):
+    if _GCS_BUCKET:
+        blob = _gcs_client().bucket(_GCS_BUCKET).blob(path.name)
+        blob.upload_from_string(json.dumps(data, indent=2, default=str),
+                                content_type="application/json")
+        return
     with open(path, "w") as f: json.dump(data, f, indent=2, default=str)
 
 def _read_profile():
+    if _GCS_BUCKET:
+        try:
+            blob = _gcs_client().bucket(_GCS_BUCKET).blob(PROFILE_F.name)
+            if not blob.exists(): return {}
+            return json.loads(blob.download_as_text())
+        except Exception: return {}
     if not PROFILE_F.exists(): return {}
     with open(PROFILE_F) as f: return json.load(f)
 
@@ -1726,4 +1752,6 @@ async def requirements_pdf():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8000))
+    reload = not _GCS_BUCKET  # no reload in production
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=reload)
