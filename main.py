@@ -3,6 +3,7 @@ import json
 import csv
 import io
 import os
+from urllib.parse import quote
 from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Optional
@@ -657,6 +658,17 @@ ADMIN_RESET_HTML = """<!DOCTYPE html>
       <textarea readonly onclick="this.select()" rows="3">{{ reset_url }}</textarea>
     </div>
     {% endif %}
+    {% if users %}
+    <div style="margin-bottom:16px;padding:10px 14px;background:var(--surface-alt,#F8FAFC);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px">
+      <div style="font-weight:600;margin-bottom:6px;color:var(--text2)">Driver accounts:</div>
+      {% for u in users %}
+      <div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border)">
+        <span style="font-family:monospace;color:var(--text1)">{{ u.username }}</span>
+        <span style="color:var(--text3)">{{ u.driver_name or '' }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
     <form action="/admin/reset" method="post" class="setup-form">
       <div class="field-group">
         <label class="field-label">Username</label>
@@ -722,6 +734,17 @@ ADMIN_HTML = """{% extends "base.html" %}
               color:{% if msg_type=='ok' %}#166534{% else %}#991b1b{% endif %};
               border-radius:var(--radius);padding:12px 16px;margin-bottom:20px;font-weight:600;font-size:13px">
     {{ msg }}
+  </div>
+  {% endif %}
+
+  {% if reset_url %}
+  <div class="admin-section" style="border-color:#A7F3D0">
+    <div class="admin-section-header" style="background:var(--green-lt);color:#065F46">🔑 Reset link for {{ reset_for }} — expires in 1 hour</div>
+    <div style="padding:14px">
+      <p style="font-size:13px;color:var(--text2);margin:0 0 8px">Copy and send this URL to the driver:</p>
+      <textarea readonly onclick="this.select()" rows="2"
+        style="width:100%;font-family:monospace;font-size:12px;padding:8px;border:1px solid var(--border);border-radius:4px;resize:none;background:#fff;box-sizing:border-box">{{ reset_url }}</textarea>
+    </div>
   </div>
   {% endif %}
 
@@ -874,6 +897,9 @@ ADMIN_HTML = """{% extends "base.html" %}
         <td>
           <div class="admin-actions">
             <a href="/admin/view/{{ d.id }}" class="btn btn-sm btn-secondary">👁 View</a>
+            <form action="/admin/driver/{{ d.id }}/reset" method="post" style="margin:0">
+              <button type="submit" class="btn btn-sm btn-secondary">🔑 Reset</button>
+            </form>
             <form action="/admin/deactivate/{{ d.id }}" method="post" style="margin:0"
                   onsubmit="return confirm('Deactivate {{ d.username }}? They will not be able to log in.')">
               <button type="submit" class="btn btn-sm btn-warning">Deactivate</button>
@@ -2304,22 +2330,24 @@ async def logout():
 
 @app.get("/admin/reset", response_class=HTMLResponse)
 async def admin_reset_get(request: Request):
-    return _tmpl("admin_reset.html", request, {"error": None, "reset_url": None})
+    users = [u for u in _read_users() if u.get("role") != "admin"]
+    return _tmpl("admin_reset.html", request, {"error": None, "reset_url": None, "users": users})
 
 @app.post("/admin/reset", response_class=HTMLResponse)
 async def admin_reset_post(request: Request, username: str = Form(...)):
+    all_users = _read_users()
+    driver_list = [u for u in all_users if u.get("role") != "admin"]
     def err(msg):
-        return _tmpl("admin_reset.html", request, {"error": msg, "reset_url": None})
+        return _tmpl("admin_reset.html", request, {"error": msg, "reset_url": None, "users": driver_list})
     if not username.strip():
         return err("Username is required.")
-    users = _read_users()
-    user = next((u for u in users if u["username"].lower() == username.lower()), None)
+    user = next((u for u in all_users if u["username"].lower() == username.lower()), None)
     if not user:
         return err(f"Username '{username}' not found.")
     token = _signer.dumps(user["id"], salt="password-reset")
     _reset_tokens[token] = user["id"]
     reset_url = str(request.base_url).rstrip("/") + f"/reset-password?token={token}"
-    return _tmpl("admin_reset.html", request, {"error": None, "reset_url": reset_url})
+    return _tmpl("admin_reset.html", request, {"error": None, "reset_url": reset_url, "users": driver_list})
 
 @app.get("/reset-password", response_class=HTMLResponse)
 async def reset_password_get(request: Request):
@@ -2481,7 +2509,21 @@ def _admin_dashboard_data(ctx: AuthCtx) -> dict:
 async def admin_dashboard(request: Request):
     ctx = _require_admin(request)
     data = _admin_dashboard_data(ctx)
-    return _tmpl("admin.html", request, {**data, **_ctx_tmpl(ctx)})
+    reset_url  = request.query_params.get("reset_url", "")
+    reset_for  = request.query_params.get("reset_for", "")
+    return _tmpl("admin.html", request, {**data, **_ctx_tmpl(ctx),
+                                         "reset_url": reset_url, "reset_for": reset_for})
+
+@app.post("/admin/driver/{driver_id}/reset")
+async def admin_driver_reset(driver_id: str, request: Request):
+    ctx = _require_admin(request)
+    users = _read_users()
+    user = next((u for u in users if u["id"] == driver_id), None)
+    if not user: raise HTTPException(404, "Driver not found")
+    token = _signer.dumps(user["id"], salt="password-reset")
+    _reset_tokens[token] = user["id"]
+    reset_url = str(request.base_url).rstrip("/") + f"/reset-password?token={token}"
+    return RedirectResponse(f"/admin?reset_url={quote(reset_url)}&reset_for={quote(user['username'])}", status_code=303)
 
 @app.get("/admin/view/{driver_id}", response_class=HTMLResponse)
 async def admin_view_driver(driver_id: str, request: Request):
