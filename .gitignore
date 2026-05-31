@@ -1,0 +1,8 @@
+.env.deploy
+__pycache__/
+data/
+static/
+templates/
+*.pdf
+.vscode/
+.claude/

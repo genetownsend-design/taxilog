@@ -3,15 +3,18 @@ import json
 import csv
 import io
 import os
+from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Optional
 from pathlib import Path
 
 from fastapi import FastAPI, Request, Form, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 import aiofiles
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+import bcrypt as _bcrypt_lib
 
 # ── paths ────────────────────────────────────────────────────────
 BASE_DIR    = Path(__file__).parent
@@ -40,6 +43,14 @@ BASE_HTML = """<!DOCTYPE html>
   <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
+{% if is_impersonating %}
+<div class="view-banner">
+  👁 Viewing <strong>{{ viewed_name }}</strong>'s account &mdash; Read Only &nbsp;
+  <form action="/admin/exit-view" method="post" style="display:inline;margin:0">
+    <button type="submit" class="view-banner-exit">Exit View →</button>
+  </form>
+</div>
+{% endif %}
 <header class="site-header">
   <div class="header-inner">
     <div class="header-brand">
@@ -48,23 +59,37 @@ BASE_HTML = """<!DOCTYPE html>
         <div class="brand-title">Taxi Pickup Daily Log</div>
         {% if profile %}
         <div class="brand-sub">{{ profile.driver_name }}{% if profile.vehicle %} &middot; {{ profile.vehicle }}{% endif %}</div>
+        {% elif role == "admin" %}
+        <div class="brand-sub">Administrator</div>
         {% endif %}
       </div>
     </div>
-    {% if profile %}
+    {% if user_id %}
     <button class="hamburger" id="hamburger" onclick="toggleNav()" aria-label="Menu">
       <span></span><span></span><span></span>
     </button>
     {% endif %}
   </div>
-  {% if profile %}
+  {% if user_id %}
   <nav class="site-nav" id="siteNav">
+    {% if role == "admin" and not is_impersonating %}
+    <a href="/admin" class="nav-link {% if request.url.path == '/admin' %}active{% endif %}" onclick="closeNav()">🏠 Admin Dashboard</a>
+    <form action="/logout" method="post" style="margin:0">
+      <button type="submit" class="nav-link" style="background:none;border:none;cursor:pointer;width:100%;text-align:left">🚪 Sign Out</button>
+    </form>
+    {% else %}
     <a href="/" class="nav-link {% if request.url.path == '/' %}active{% endif %}" onclick="closeNav()">📋 Log</a>
     <a href="#" class="nav-link" onclick="closeNav();openShiftModal()">⏱ Shift</a>
     <a href="#" class="nav-link" onclick="closeNav();openExpenseModal()">💸 Expenses</a>
     <a href="#" class="nav-link" onclick="closeNav();openModal('reportModal')">📊 Report</a>
     <a href="#" class="nav-link" onclick="closeNav();openModal('backupModal')">💾 Backup</a>
+    {% if not is_impersonating %}
     <a href="/setup" class="nav-link {% if request.url.path == '/setup' %}active{% endif %}" onclick="closeNav()">⚙️ Setup</a>
+    {% endif %}
+    <form action="/logout" method="post" style="margin:0">
+      <button type="submit" class="nav-link" style="background:none;border:none;cursor:pointer;width:100%;text-align:left">🚪 Sign Out</button>
+    </form>
+    {% endif %}
   </nav>
   {% endif %}
 </header>
@@ -105,14 +130,16 @@ BASE_HTML = """<!DOCTYPE html>
       <div class="section-label">Full Backup</div>
       <p style="font-size:12px;color:var(--text3);margin-bottom:10px">Saves all data files as a single ZIP — you choose where.</p>
       <div class="btn-group mb-4">
-        <button class="btn btn-primary" onclick="saveFullBackup()">💾 Save Full Backup</button>
+        <a href="/api/backup/all" class="btn btn-primary" download>💾 Save Full Backup</a>
       </div>
       <div class="section-label">Full Restore</div>
       <div class="warning-text">⚠️ Restores ALL data from a backup ZIP. Cannot be undone.</div>
       <div class="btn-group mb-4">
-        <button class="btn btn-warning" onclick="restoreFromZip()">📂 Select Backup &amp; Restore</button>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:4px">
+          <input type="file" id="restoreZip" accept=".zip" class="field-input" style="flex:1;min-width:180px">
+          <button class="btn btn-warning" onclick="restoreFromZip()">📂 Restore</button>
+        </div>
       </div>
-      <input type="file" id="restoreZip" accept=".zip" style="display:none">
       <hr class="divider">
       <div class="section-label">Individual File Backups</div>
       <div class="btn-group mb-4">
@@ -313,7 +340,7 @@ INDEX_HTML = """{% extends "base.html" %}
         <div class="field-group">
           <label class="field-label">Tip ($)</label>
           <input type="number" id="tip" name="tip" class="field-input"
-                 step="0.01" min="0" placeholder="0.00" oninput="updateCalcTotal()">
+                 step="0.01" min="0" placeholder="0.00" oninput="updateCalcTotal();autoTipPm()">
         </div>
         <div class="field-group">
           <label class="field-label">Tip Payment</label>
@@ -348,6 +375,10 @@ INDEX_HTML = """{% extends "base.html" %}
         <div class="owed-driver-bar">
           <span class="owed-driver-label" id="owedDriverLabel">Owed Driver</span>
           <span class="owed-driver-val" id="owedDriverVal">$0.00</span>
+        </div>
+        <div class="owed-driver-bar earnings-bar" id="earningsBar" style="display:none">
+          <span class="owed-driver-label">Earnings</span>
+          <span class="owed-driver-val" id="earningsVal">$0.00</span>
         </div>
       </div>
     </div>
@@ -424,6 +455,25 @@ SETUP_HTML = """{% extends "base.html" %}
 
       <button type="submit" class="btn btn-primary btn-full mt-4">Save Profile &amp; Continue →</button>
     </form>
+
+    <hr class="divider" style="margin:28px 0">
+    <div class="setup-section-title">🔑 Change Password</div>
+    <div id="pwMsg" style="display:none;margin-bottom:12px;font-size:13px;padding:8px 12px;border-radius:8px"></div>
+    <form id="pwForm" class="setup-form" onsubmit="changePw(event)">
+      <div class="field-group">
+        <label class="field-label">Current Password</label>
+        <input type="password" id="pwCurrent" class="field-input" autocomplete="current-password" placeholder="••••••••">
+      </div>
+      <div class="field-group">
+        <label class="field-label">New Password</label>
+        <input type="password" id="pwNew" class="field-input" autocomplete="new-password" placeholder="••••••••" minlength="6">
+      </div>
+      <div class="field-group">
+        <label class="field-label">Confirm New Password</label>
+        <input type="password" id="pwConfirm" class="field-input" autocomplete="new-password" placeholder="••••••••" minlength="6">
+      </div>
+      <button type="submit" class="btn btn-secondary btn-full">Update Password</button>
+    </form>
   </div>
 </div>
 {% endblock %}
@@ -431,7 +481,7 @@ SETUP_HTML = """{% extends "base.html" %}
 <script>
 const _explains = {
   standard:   'Formula: ((Credit Meter + Voucher Meter) − Cash Meter) ÷ 2 + Credit Tips + Voucher Tips',
-  gate:       'Formula: Grand Total − Daily Gate Fee',
+  gate:       'Formula: (Credit Meter + Voucher Meter) ÷ 2 + Credit Tips + Voucher Tips − Daily Gate Fee',
   commission: 'Formula: Meter Total × Driver% + All Tips  (you keep everything above the company cut)',
   owner:      'You keep 100% of all fares and tips. Track your own expenses separately.'
 };
@@ -442,6 +492,544 @@ function togglePayFields(){
   document.getElementById('payModeExplain').textContent = _explains[mode] || '';
 }
 togglePayFields();
+
+async function changePw(e){
+  e.preventDefault();
+  const cur=document.getElementById('pwCurrent').value;
+  const nw=document.getElementById('pwNew').value;
+  const cf=document.getElementById('pwConfirm').value;
+  const msg=document.getElementById('pwMsg');
+  if(nw!==cf){showMsg(msg,'Passwords do not match.','#fee2e2','#991b1b');return;}
+  if(nw.length<6){showMsg(msg,'New password must be at least 6 characters.','#fee2e2','#991b1b');return;}
+  const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({current_password:cur,new_password:nw})});
+  const d=await r.json();
+  if(r.ok){showMsg(msg,'Password updated.','#dcfce7','#166534');document.getElementById('pwForm').reset();}
+  else{showMsg(msg,d.detail||'Error.','#fee2e2','#991b1b');}
+}
+function showMsg(el,text,bg,color){el.style.display='';el.style.background=bg;el.style.color=color;el.textContent=text;}
+</script>
+{% endblock %}
+"""
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign In – Taxi Log</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="auth-page">
+  <div class="auth-card">
+    <div class="setup-icon">🚕</div>
+    <div class="setup-title">Taxi Log</div>
+    <div class="setup-sub">Sign in to your account</div>
+    {% if success %}<div class="auth-success">{{ success }}</div>{% endif %}
+    {% if error %}<div class="auth-error">{{ error }}</div>{% endif %}
+    <form action="/login" method="post" class="setup-form">
+      <div class="field-group">
+        <label class="field-label">Username</label>
+        <input type="text" name="username" class="field-input" required autofocus
+               autocomplete="username" placeholder="Your username">
+      </div>
+      <div class="field-group">
+        <label class="field-label">Password</label>
+        <input type="password" name="password" class="field-input" required
+               autocomplete="current-password" placeholder="••••••••">
+      </div>
+      <button type="submit" class="btn btn-primary btn-full mt-4">Sign In →</button>
+    </form>
+    {% if allow_register %}
+    <p class="auth-foot">No account yet? <a href="/register" class="auth-link">Create one</a></p>
+    {% endif %}
+  </div>
+</div>
+</body>
+</html>
+"""
+
+REGISTER_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Create Account – Taxi Log</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="auth-page">
+  <div class="auth-card">
+    <div class="setup-icon">🚕</div>
+    <div class="setup-title">Create Account</div>
+    <div class="setup-sub">{% if is_first %}Welcome — set up the first driver account{% else %}Register a new driver{% endif %}</div>
+    {% if error %}<div class="auth-error">{{ error }}</div>{% endif %}
+    <form action="/register" method="post" class="setup-form">
+      <div class="field-group">
+        <label class="field-label">Username <span class="required">*</span></label>
+        <input type="text" name="username" class="field-input" required autofocus
+               autocomplete="username" placeholder="Choose a username">
+      </div>
+      <div class="field-group">
+        <label class="field-label">Password <span class="required">*</span></label>
+        <input type="password" name="password" class="field-input" required
+               autocomplete="new-password" placeholder="••••••••" minlength="6">
+      </div>
+      <div class="field-group">
+        <label class="field-label">Confirm Password <span class="required">*</span></label>
+        <input type="password" name="confirm" class="field-input" required
+               autocomplete="new-password" placeholder="••••••••" minlength="6">
+      </div>
+      <button type="submit" class="btn btn-primary btn-full mt-4">Create Account →</button>
+    </form>
+    <p class="auth-foot">Already have an account? <a href="/login" class="auth-link">Sign in</a></p>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+ADMIN_REGISTER_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Create Admin Account – Taxi Log</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="auth-page">
+  <div class="auth-card">
+    <div class="setup-icon">🔐</div>
+    <div class="setup-title">Create Admin Account</div>
+    <div class="setup-sub">Administrator access — requires admin secret key</div>
+    {% if error %}<div class="auth-error">{{ error }}</div>{% endif %}
+    <form action="/admin/register" method="post" class="setup-form">
+      <div class="field-group">
+        <label class="field-label">Username <span class="required">*</span></label>
+        <input type="text" name="username" class="field-input" required autofocus
+               autocomplete="username" placeholder="Choose a username">
+      </div>
+      <div class="field-group">
+        <label class="field-label">Password <span class="required">*</span></label>
+        <input type="password" name="password" class="field-input" required
+               autocomplete="new-password" placeholder="••••••••" minlength="6">
+      </div>
+      <div class="field-group">
+        <label class="field-label">Confirm Password <span class="required">*</span></label>
+        <input type="password" name="confirm" class="field-input" required
+               autocomplete="new-password" placeholder="••••••••" minlength="6">
+      </div>
+      <div class="field-group">
+        <label class="field-label">Admin Secret Key <span class="required">*</span></label>
+        <input type="password" name="admin_secret" class="field-input" required
+               autocomplete="off" placeholder="Provided by system administrator">
+      </div>
+      <button type="submit" class="btn btn-primary btn-full mt-4">Create Admin Account →</button>
+    </form>
+    <p class="auth-foot"><a href="/login" class="auth-link">← Back to Sign In</a></p>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+ADMIN_RESET_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Generate Reset Link – Taxi Log</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="auth-page">
+  <div class="auth-card">
+    <div class="setup-icon">🔑</div>
+    <div class="setup-title">Reset Password</div>
+    <div class="setup-sub">Generate a one-time reset link for a driver</div>
+    {% if error %}<div class="auth-error">{{ error }}</div>{% endif %}
+    {% if reset_url %}
+    <div class="reset-url-box">
+      <p style="font-size:13px;color:#065F46;font-weight:600;margin:0 0 6px">Link generated — expires in 1 hour.</p>
+      <p style="font-size:12px;color:var(--text3);margin:0 0 8px">Copy and send this URL to the driver:</p>
+      <textarea readonly onclick="this.select()" rows="3">{{ reset_url }}</textarea>
+    </div>
+    {% endif %}
+    <form action="/admin/reset" method="post" class="setup-form">
+      <div class="field-group">
+        <label class="field-label">Username</label>
+        <input type="text" name="username" class="field-input" required autofocus placeholder="Driver username">
+      </div>
+      <button type="submit" class="btn btn-primary btn-full mt-4">Generate Link →</button>
+    </form>
+    <p class="auth-foot"><a href="/login" class="auth-link">← Back to Sign In</a></p>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+RESET_PASSWORD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reset Password – Taxi Log</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="auth-page">
+  <div class="auth-card">
+    <div class="setup-icon">🔐</div>
+    <div class="setup-title">Reset Password</div>
+    {% if error %}
+    <div class="setup-sub" style="color:var(--red)">{{ error }}</div>
+    <p class="auth-foot">Ask the admin to <a href="/admin/reset" class="auth-link">generate a new link</a>.</p>
+    {% else %}
+    <div class="setup-sub">Enter your new password</div>
+    {% if form_error %}<div class="auth-error">{{ form_error }}</div>{% endif %}
+    <form action="/reset-password" method="post" class="setup-form">
+      <input type="hidden" name="token" value="{{ token }}">
+      <div class="field-group">
+        <label class="field-label">New Password</label>
+        <input type="password" name="new_password" class="field-input" required autofocus
+               autocomplete="new-password" placeholder="••••••••" minlength="6">
+      </div>
+      <div class="field-group">
+        <label class="field-label">Confirm Password</label>
+        <input type="password" name="new_password2" class="field-input" required
+               autocomplete="new-password" placeholder="••••••••" minlength="6">
+      </div>
+      <button type="submit" class="btn btn-primary btn-full mt-4">Set New Password →</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+</body>
+</html>
+"""
+
+ADMIN_HTML = """{% extends "base.html" %}
+{% block title %}Admin Dashboard – Taxi Log{% endblock %}
+{% block content %}
+<div class="admin-page">
+  <h1 style="font-size:22px;font-weight:800;margin-bottom:24px;color:var(--text)">🏠 Admin Dashboard</h1>
+
+  {% if msg %}
+  <div style="background:{% if msg_type=='ok' %}var(--green-lt){% else %}var(--red-lt){% endif %};
+              color:{% if msg_type=='ok' %}#166534{% else %}#991b1b{% endif %};
+              border-radius:var(--radius);padding:12px 16px;margin-bottom:20px;font-weight:600;font-size:13px">
+    {{ msg }}
+  </div>
+  {% endif %}
+
+  <!-- Stats -->
+  <div class="admin-section">
+    <div class="admin-section-header">📊 Fleet Overview</div>
+    <div class="admin-stat-grid">
+      <div class="admin-stat">
+        <div class="admin-stat-val">{{ active_drivers|length }}</div>
+        <div class="admin-stat-label">Active Drivers</div>
+      </div>
+      <div class="admin-stat">
+        <div class="admin-stat-val">{{ fleet_today.count }}</div>
+        <div class="admin-stat-label">Pickups Today</div>
+      </div>
+      <div class="admin-stat">
+        <div class="admin-stat-val">${{ "%.2f"|format(fleet_today.grand_total) }}</div>
+        <div class="admin-stat-label">Gross Today</div>
+      </div>
+      <div class="admin-stat">
+        <div class="admin-stat-val">${{ "%.2f"|format(fleet_today.driver_earnings) }}</div>
+        <div class="admin-stat-label">Driver Earnings Today</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Today's Fleet Totals -->
+  <div class="admin-section">
+    <div class="admin-section-header">📋 Today's Totals — {{ today_str }}</div>
+    {% if today_rows and fleet_today.count > 0 %}
+    <div class="admin-table-wrap"><table class="admin-table">
+      <thead><tr>
+        <th>Driver</th><th>Pickups</th><th>Meter</th><th>Tips</th>
+        <th>Gross</th><th>Expenses</th><th>Owed Driver</th><th>Earnings</th>
+      </tr></thead>
+      <tbody>
+      {% for r in today_rows %}
+      <tr>
+        <td><strong>{{ r.driver_name }}</strong></td>
+        <td style="text-align:center">{{ r.count }}</td>
+        <td>${{ "%.2f"|format(r.meter_total) }}</td>
+        <td>${{ "%.2f"|format(r.tip_total) }}</td>
+        <td>${{ "%.2f"|format(r.grand_total) }}</td>
+        <td style="color:var(--red)">${{ "%.2f"|format(r.expense_total) }}</td>
+        <td>${{ "%.2f"|format(r.owed_driver) }}</td>
+        <td style="color:var(--green);font-weight:700">${{ "%.2f"|format(r.driver_earnings) }}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+      <tfoot>
+      <tr style="background:var(--amber-xl);font-weight:700;border-top:2px solid var(--amber)">
+        <td>Fleet Total</td>
+        <td style="text-align:center">{{ fleet_today.count }}</td>
+        <td>${{ "%.2f"|format(fleet_today.meter) }}</td>
+        <td>${{ "%.2f"|format(fleet_today.tips) }}</td>
+        <td>${{ "%.2f"|format(fleet_today.grand_total) }}</td>
+        <td style="color:var(--red)">${{ "%.2f"|format(fleet_today.expense_total) }}</td>
+        <td>${{ "%.2f"|format(fleet_today.owed_driver) }}</td>
+        <td style="color:var(--green)">${{ "%.2f"|format(fleet_today.driver_earnings) }}</td>
+      </tr>
+      </tfoot>
+    </table></div>
+    {% else %}
+    <div style="padding:20px;color:var(--text3);font-size:13px">No pickups recorded today across any driver.</div>
+    {% endif %}
+  </div>
+
+  <!-- Fleet Report -->
+  <div class="admin-section">
+    <div class="admin-section-header">📊 Fleet Report</div>
+    <div style="padding:16px 20px">
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:16px">
+        <div class="field-group" style="margin:0;min-width:140px;flex:1">
+          <label class="field-label">From Date</label>
+          <input type="date" id="frFrom" class="field-input">
+        </div>
+        <div class="field-group" style="margin:0;min-width:140px;flex:1">
+          <label class="field-label">To Date</label>
+          <input type="date" id="frTo" class="field-input">
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-primary" onclick="loadFleetReport()">Generate</button>
+          <button class="btn btn-secondary" onclick="downloadFleetPDF()" id="frPdfBtn" style="display:none">⬇ PDF</button>
+        </div>
+      </div>
+      <div id="frOutput"></div>
+    </div>
+  </div>
+
+  <!-- Fleet Backup & Restore -->
+  <div class="admin-section">
+    <div class="admin-section-header">💾 Fleet Backup &amp; Restore</div>
+    <div style="padding:16px 20px">
+      <div class="setup-section-title">Full Fleet Backup</div>
+      <p style="font-size:12px;color:var(--text3);margin:4px 0 12px">Downloads a single ZIP containing every driver's data plus user accounts — use this for complete disaster recovery.</p>
+      <a href="/api/admin/backup/all" class="btn btn-primary" download>💾 Save Fleet Backup</a>
+      <hr class="divider" style="margin:20px 0">
+      <div class="setup-section-title">Full Fleet Restore</div>
+      <div class="warning-text" style="margin:6px 0 12px">⚠️ Restores ALL driver data and user accounts from a fleet backup ZIP. Overwrites everything. Cannot be undone.</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:4px">
+        <input type="file" id="fleetRestoreInput" accept=".zip" class="field-input" style="flex:1;min-width:180px">
+        <button class="btn btn-warning" onclick="restoreFleetBackup()">📂 Restore</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Design Document -->
+  <div class="admin-section">
+    <div class="admin-section-header">📄 Application Design Document</div>
+    <div style="padding:16px 20px">
+      <div class="setup-section-title">Current Design Document</div>
+      <p style="font-size:12px;color:var(--text3);margin:4px 0 12px">Downloads a PDF describing the current application architecture, features, data model, and technical stack.</p>
+      <a href="/api/admin/design-pdf" class="btn btn-primary" download>📄 Download Design PDF</a>
+    </div>
+  </div>
+
+  <!-- Danger Zone -->
+  <div class="admin-section" style="border-color:var(--red)">
+    <div class="admin-section-header" style="color:var(--red);background:#fff5f5">🗑 Danger Zone</div>
+    <div style="padding:16px 20px">
+      <div class="setup-section-title" style="color:var(--red)">Delete Entire Database</div>
+      <p style="font-size:12px;color:var(--text3);margin:4px 0 12px">Permanently deletes <strong>all driver accounts and all data</strong> for every driver. Only admin logins are preserved. This cannot be undone.</p>
+      <button class="btn btn-danger" onclick="document.getElementById('delConfirmPanel').style.display=''">🗑 Delete Entire Database</button>
+      <div id="delConfirmPanel" style="display:none;margin-top:16px;background:#fff5f5;border:1px solid #fecaca;border-radius:var(--radius);padding:16px">
+        <p style="font-size:13px;font-weight:700;color:var(--red);margin-bottom:8px">⚠️ This will permanently delete ALL driver accounts and ALL their data. Admin logins are preserved. This cannot be undone.</p>
+        <label class="field-label">Type DELETE to confirm</label>
+        <input type="text" id="delConfirmInput" class="field-input" placeholder="DELETE" autocomplete="off" style="margin-bottom:12px">
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-danger" onclick="confirmDeleteAll()">Confirm Delete</button>
+          <button class="btn btn-secondary" onclick="document.getElementById('delConfirmPanel').style.display='none';document.getElementById('delConfirmInput').value=''">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Active Drivers -->
+  <div class="admin-section">
+    <div class="admin-section-header">🚕 Active Drivers</div>
+    {% if active_drivers %}
+    <div class="admin-table-wrap"><table class="admin-table">
+      <thead><tr>
+        <th>Driver Name</th><th>Username</th><th>Joined</th><th>Actions</th>
+      </tr></thead>
+      <tbody>
+      {% for d in active_drivers %}
+      <tr>
+        <td><strong>{{ d.profile_name or '(no profile)' }}</strong></td>
+        <td>{{ d.username }}</td>
+        <td style="color:var(--text3);font-size:12px">{{ d.created_at[:10] }}</td>
+        <td>
+          <div class="admin-actions">
+            <a href="/admin/view/{{ d.id }}" class="btn btn-sm btn-secondary">👁 View</a>
+            <form action="/admin/deactivate/{{ d.id }}" method="post" style="margin:0"
+                  onsubmit="return confirm('Deactivate {{ d.username }}? They will not be able to log in.')">
+              <button type="submit" class="btn btn-sm btn-warning">Deactivate</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+    {% else %}
+    <div style="padding:20px;color:var(--text3);font-size:13px">No active drivers yet. Share <a href="/register" class="auth-link">/register</a> with drivers to get started.</div>
+    {% endif %}
+  </div>
+
+  <!-- Administrators -->
+  <div class="admin-section">
+    <div class="admin-section-header">🔐 Administrators</div>
+    <div class="admin-table-wrap"><table class="admin-table">
+      <thead><tr><th>Username</th><th>Joined</th><th>Actions</th></tr></thead>
+      <tbody>
+      {% for a in admins %}
+      <tr>
+        <td><strong>{{ a.username }}</strong> {% if a.id == current_user_id %}<span style="font-size:11px;color:var(--text3)">(you)</span>{% endif %}</td>
+        <td style="color:var(--text3);font-size:12px">{{ a.created_at[:10] }}</td>
+        <td>
+          {% if a.id != current_user_id %}
+          <div class="admin-actions">
+            <form action="/admin/deactivate/{{ a.id }}" method="post" style="margin:0"
+                  onsubmit="return confirm('Deactivate admin {{ a.username }}?')">
+              <button type="submit" class="btn btn-sm btn-warning">Deactivate</button>
+            </form>
+          </div>
+          {% else %}
+          <span style="font-size:12px;color:var(--text3)">—</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+    {% if admin_secret_set %}
+    <div style="padding:12px 20px;font-size:12px;color:var(--text3)">
+      To add an administrator: share the <a href="/admin/register" class="auth-link">/admin/register</a> URL along with the admin secret key.
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- Deactivated Accounts -->
+  {% if inactive_drivers %}
+  <div class="admin-section">
+    <div class="admin-section-header" style="color:var(--red)">⚠️ Deactivated Accounts</div>
+    <div class="admin-table-wrap"><table class="admin-table">
+      <thead><tr><th>Username</th><th>Deactivated</th><th>Actions</th></tr></thead>
+      <tbody>
+      {% for d in inactive_drivers %}
+      <tr>
+        <td><strong>{{ d.username }}</strong></td>
+        <td style="color:var(--text3);font-size:12px">{{ d.created_at[:10] }}</td>
+        <td>
+          <div class="admin-actions">
+            <form action="/admin/reactivate/{{ d.id }}" method="post" style="margin:0">
+              <button type="submit" class="btn btn-sm btn-secondary">Reactivate</button>
+            </form>
+            <form action="/admin/delete/{{ d.id }}" method="post" style="margin:0"
+                  onsubmit="return confirm('Permanently delete {{ d.username }} and ALL their data? This cannot be undone.')">
+              <button type="submit" class="btn btn-sm btn-danger">Delete Forever</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+  </div>
+  {% endif %}
+
+</div>
+{% endblock %}
+{% block extra_js %}
+<script>
+async function loadFleetReport(){
+  const from=document.getElementById('frFrom').value;
+  const to=document.getElementById('frTo').value;
+  const out=document.getElementById('frOutput');
+  out.innerHTML='<div style="color:var(--text3);font-size:13px;padding:8px 0">Loading…</div>';
+  const params=new URLSearchParams();
+  if(from)params.set('from_date',from);
+  if(to)params.set('to_date',to);
+  const r=await fetch('/api/admin/fleet-report?'+params);
+  if(!r.ok){out.innerHTML='<div style="color:var(--red);font-size:13px">Error loading report.</div>';return;}
+  const d=await r.json();
+  if(!d.drivers.length){out.innerHTML='<div style="color:var(--text3);font-size:13px">No data for this period.</div>';document.getElementById('frPdfBtn').style.display='none';return;}
+  let rows=d.drivers.map(dr=>`<tr>
+    <td><strong>${dr.driver_name}</strong></td>
+    <td style="text-align:center">${dr.days_worked}</td>
+    <td style="text-align:center">${dr.count}</td>
+    <td>$${dr.meter_total.toFixed(2)}</td>
+    <td>$${dr.tip_total.toFixed(2)}</td>
+    <td>$${dr.grand_total.toFixed(2)}</td>
+    <td style="color:var(--red)">$${dr.expense_total.toFixed(2)}</td>
+    <td>$${dr.owed_driver.toFixed(2)}</td>
+    <td style="color:var(--green);font-weight:700">$${dr.driver_earnings.toFixed(2)}</td>
+  </tr>`).join('');
+  const s=d.summary;
+  rows+=`<tr style="background:var(--amber-xl);font-weight:700;border-top:2px solid var(--amber)">
+    <td>Fleet Total</td>
+    <td style="text-align:center">${s.driver_count} drivers</td>
+    <td style="text-align:center">${s.count}</td>
+    <td>$${s.meter_total.toFixed(2)}</td>
+    <td>$${s.tip_total.toFixed(2)}</td>
+    <td>$${s.grand_total.toFixed(2)}</td>
+    <td style="color:var(--red)">$${s.expense_total.toFixed(2)}</td>
+    <td>$${s.owed_driver.toFixed(2)}</td>
+    <td style="color:var(--green)">$${s.driver_earnings.toFixed(2)}</td>
+  </tr>`;
+  out.innerHTML=`<div class="admin-table-wrap"><table class="admin-table"><thead><tr>
+    <th>Driver</th><th>Days</th><th>Pickups</th><th>Meter</th><th>Tips</th>
+    <th>Gross</th><th>Expenses</th><th>Owed Driver</th><th>Earnings</th>
+  </tr></thead><tbody>${rows}</tbody></table></div>`;
+  document.getElementById('frPdfBtn').style.display='';
+}
+function downloadFleetPDF(){
+  const from=document.getElementById('frFrom').value;
+  const to=document.getElementById('frTo').value;
+  const p=new URLSearchParams();
+  if(from)p.set('from_date',from);if(to)p.set('to_date',to);
+  window.location='/api/admin/fleet-report-pdf?'+p;
+}
+
+async function confirmDeleteAll(){
+  const val=document.getElementById('delConfirmInput').value.trim();
+  if(val!=='DELETE'){showToast('Type DELETE to confirm');return;}
+  document.getElementById('delConfirmPanel').style.display='none';
+  showToast('Deleting…',60000);
+  const r=await fetch('/api/admin/delete-all',{method:'POST'});
+  if(r.ok){showToast('Database deleted — reloading…',3000);setTimeout(()=>window.location.reload(),2000);}
+  else{const e=await r.json().catch(()=>({}));showToast(e.detail||'Delete failed');}
+}
+
+async function restoreFleetBackup(){
+  const input=document.getElementById('fleetRestoreInput');
+  if(!input.files.length){showToast('Select a ZIP file first');return;}
+  const file=input.files[0];
+  showToast('Restoring…',60000);
+  const form=new FormData();form.append('file',file);
+  const r=await fetch('/api/admin/restore/all',{method:'POST',body:form});
+  if(r.ok){
+    const d=await r.json();
+    showToast('Restored '+d.restored.length+' files — reloading…',3000);
+    setTimeout(()=>window.location.reload(),2000);
+  }else{
+    const err=await r.json().catch(()=>({}));
+    showToast(err.detail||'Restore failed');
+  }
+}
 </script>
 {% endblock %}
 """
@@ -453,11 +1041,11 @@ togglePayFields();
 CSS = """\
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --amber:#F59E0B;--amber-d:#D97706;--amber-dd:#B45309;
-  --amber-lt:#FEF3C7;--amber-xl:#FFFBEB;
-  --bg:#F8F7F4;--surface:#FFFFFF;--surface2:#F3F2EF;
-  --border:#E5E3DE;--border2:#D1CEC7;
-  --text:#1A1815;--text2:#6B6660;--text3:#9C9790;
+  --amber:#FFCB05;--amber-d:#E5B700;--amber-dd:#A38400;
+  --amber-lt:#FFF8CC;--amber-xl:#FFFDE5;
+  --bg:#F5F7FA;--surface:#FFFFFF;--surface2:#EEF1F6;
+  --border:#DDE2EA;--border2:#C5CDD8;
+  --text:#0A1628;--text2:#6B6660;--text3:#9C9790;
   --red:#EF4444;--red-lt:#FEE2E2;
   --green:#10B981;--green-lt:#D1FAE5;
   --blue:#3B82F6;--blue-lt:#DBEAFE;
@@ -470,7 +1058,11 @@ CSS = """\
   --font:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 }
 body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:14px;line-height:1.5;min-height:100vh}
-.site-header{background:linear-gradient(135deg,#1A1815 0%,#2D2A26 100%);border-bottom:1px solid rgba(255,255,255,.08);position:sticky;top:0;z-index:200;box-shadow:0 2px 20px rgba(0,0,0,.25)}
+.view-banner{background:#00274C;color:#FFF8CC;font-size:13px;text-align:center;padding:8px 16px;position:sticky;top:0;z-index:300}
+.view-banner strong{color:#FFCB05}
+.view-banner-exit{background:#FFCB05;color:#00274C;border:none;border-radius:6px;padding:3px 10px;font-size:12px;cursor:pointer;margin-left:10px;font-weight:700}
+.view-banner-exit:hover{background:#E5B700}
+.site-header{background:linear-gradient(135deg,#00274C 0%,#003366 100%);border-bottom:1px solid rgba(255,255,255,.08);position:sticky;top:0;z-index:200;box-shadow:0 2px 20px rgba(0,0,0,.25)}
 .header-inner{max-width:1280px;margin:0 auto;padding:0 24px;height:60px;display:flex;align-items:center;justify-content:space-between;gap:16px}
 .header-brand{display:flex;align-items:center;gap:12px}
 .taxi-icon{font-size:24px}
@@ -482,11 +1074,11 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:14
 .hamburger.open span:nth-child(1){transform:translateY(7px) rotate(45deg)}
 .hamburger.open span:nth-child(2){opacity:0}
 .hamburger.open span:nth-child(3){transform:translateY(-7px) rotate(-45deg)}
-.site-nav{display:none;flex-direction:column;background:#1C1917;border-top:1px solid rgba(255,255,255,.08);padding:8px 24px 12px}
+.site-nav{display:none;flex-direction:column;background:#001F3D;border-top:1px solid rgba(255,255,255,.08);padding:8px 24px 12px}
 .site-nav.open{display:flex}
 .nav-link{color:rgba(255,255,255,.7);text-decoration:none;padding:10px 14px;border-radius:var(--radius-sm);font-size:14px;font-weight:500;transition:all .15s;display:flex;align-items:center;gap:8px}
 .nav-link:hover{color:#fff;background:rgba(255,255,255,.08)}
-.nav-link.active{color:var(--amber);background:rgba(245,158,11,.12)}
+.nav-link.active{color:var(--amber);background:rgba(255,203,5,.15)}
 .site-main{max-width:1280px;margin:0 auto;padding:24px}
 .page-layout{display:grid;grid-template-columns:400px 1fr;gap:20px;align-items:start}
 @media(max-width:900px){.page-layout{grid-template-columns:1fr}}
@@ -500,7 +1092,7 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:14
 .required{color:var(--amber-d);margin-left:2px}
 .field-input{border:1.5px solid var(--border);border-radius:var(--radius-sm);padding:9px 11px;font-size:14px;color:var(--text);background:var(--surface);transition:border-color .15s,box-shadow .15s;width:100%;font-family:var(--font)}
 .field-input:hover{border-color:var(--border2)}
-.field-input:focus{outline:none;border-color:var(--amber);box-shadow:0 0 0 3px rgba(245,158,11,.12)}
+.field-input:focus{outline:none;border-color:var(--amber);box-shadow:0 0 0 3px rgba(255,203,5,.18)}
 select.field-input{cursor:pointer}
 .row-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .autocomplete-wrap{position:relative}
@@ -510,15 +1102,15 @@ select.field-input{cursor:pointer}
 .ac-item:hover{background:var(--amber-xl)}
 .ac-name{font-weight:600;font-size:13px;color:var(--text)}
 .ac-detail{font-size:11px;color:var(--text3);margin-top:1px}
-.calc-total-bar{background:linear-gradient(135deg,var(--amber-dd) 0%,var(--amber-d) 100%);border-radius:var(--radius);padding:14px 16px;display:flex;justify-content:space-between;align-items:center;margin:16px 0 12px;box-shadow:0 2px 8px rgba(217,119,6,.25)}
+.calc-total-bar{background:linear-gradient(135deg,#00274C 0%,#003A6B 100%);border-radius:var(--radius);padding:14px 16px;display:flex;justify-content:space-between;align-items:center;margin:16px 0 12px;box-shadow:0 2px 8px rgba(0,39,76,.3)}
 .calc-total-label{color:rgba(255,255,255,.8);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em}
 .calc-total-value{color:#fff;font-size:24px;font-weight:800;letter-spacing:-.5px}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:9px 18px;border-radius:var(--radius-sm);font-size:13.5px;font-weight:600;cursor:pointer;border:none;transition:all .15s;text-decoration:none;font-family:var(--font);letter-spacing:-.1px}
 .btn:active{transform:scale(.97)}
-.btn-primary{background:var(--amber);color:#fff;box-shadow:0 2px 8px rgba(245,158,11,.3)}
-.btn-primary:hover{background:var(--amber-d);box-shadow:0 4px 12px rgba(245,158,11,.4);transform:translateY(-1px)}
-.btn-secondary{background:var(--text);color:#fff}
-.btn-secondary:hover{background:#333}
+.btn-primary{background:var(--amber);color:#00274C;box-shadow:0 2px 8px rgba(255,203,5,.35)}
+.btn-primary:hover{background:var(--amber-d);box-shadow:0 4px 12px rgba(255,203,5,.45);transform:translateY(-1px)}
+.btn-secondary{background:#00274C;color:#fff}
+.btn-secondary:hover{background:#003A6B}
 .btn-ghost{background:transparent;color:var(--text2);border:1.5px solid var(--border)}
 .btn-ghost:hover{background:var(--surface2);border-color:var(--border2);color:var(--text)}
 .btn-danger{background:var(--red);color:#fff}
@@ -549,16 +1141,17 @@ select.field-input{cursor:pointer}
 .pickup-meta{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--text3)}
 .pickup-card-foot{padding:8px 14px;border-top:1px solid var(--border);display:flex;gap:6px;background:var(--surface)}
 .totals-panel{margin:0 12px 12px;border-radius:var(--radius);overflow:hidden;border:1px solid var(--border)}
-.totals-head{background:var(--text);padding:10px 14px}
+.totals-head{background:#00274C;padding:10px 14px}
 .totals-head-label{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:rgba(255,255,255,.45);font-weight:600}
 .totals-grid{display:grid;grid-template-columns:1fr 1fr;background:var(--surface2)}
 .total-cell{padding:10px 14px;border-right:1px solid var(--border);border-bottom:1px solid var(--border)}
 .total-cell:nth-child(even){border-right:none}
 .total-cell-label{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--text3);font-weight:600;margin-bottom:2px}
 .total-cell-val{font-size:16px;font-weight:700;color:var(--text);letter-spacing:-.3px}
-.owed-driver-bar{padding:14px 16px;background:var(--amber-d);display:flex;justify-content:space-between;align-items:center}
-.owed-driver-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:rgba(255,255,255,.8)}
-.owed-driver-val{font-size:26px;font-weight:800;color:#fff;letter-spacing:-.5px}
+.owed-driver-bar{padding:14px 16px;background:#00274C;display:flex;justify-content:space-between;align-items:center}
+.earnings-bar{background:#166534}
+.owed-driver-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:rgba(255,203,5,.7)}
+.owed-driver-val{font-size:26px;font-weight:800;color:#FFCB05;letter-spacing:-.5px}
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:500;display:flex;align-items:center;justify-content:center;padding:20px}
 .modal-box{background:var(--surface);border-radius:var(--radius-lg);box-shadow:var(--shadow-lg);width:100%;max-width:520px;max-height:90vh;overflow-y:auto;border:1px solid var(--border)}
 .modal-wide{max-width:900px}
@@ -569,18 +1162,18 @@ select.field-input{cursor:pointer}
 .modal-body{padding:22px}
 .report-controls{border-bottom:1px solid var(--border);padding-bottom:16px}
 .report-output{font-size:13px}
-.report-day{margin-bottom:20px;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
-.report-day-hdr{background:var(--text);color:#fff;padding:10px 14px;display:flex;justify-content:space-between;align-items:center}
-.report-shift-bar{background:#2D2A26;color:rgba(255,255,255,.6);font-size:11px;padding:5px 14px}
-.report-table{width:100%;border-collapse:collapse}
-.report-table th{background:var(--amber-lt);padding:8px 12px;text-align:left;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--amber-dd);border-bottom:1px solid var(--border)}
-.report-table td{padding:8px 12px;border-bottom:1px solid var(--border);font-size:13px}
+.report-day{margin-bottom:20px;border:1px solid var(--border);border-radius:var(--radius)}
+.report-day-hdr{background:#00274C;color:#fff;padding:10px 14px;display:flex;justify-content:space-between;align-items:center}
+.report-shift-bar{background:#001F3D;color:rgba(255,203,5,.6);font-size:11px;padding:5px 14px}
+.report-table{width:100%;border-collapse:collapse;min-width:520px}
+.report-table th{background:var(--amber-lt);padding:8px 12px;text-align:left;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--amber-dd);border-bottom:1px solid var(--border);white-space:nowrap}
+.report-table td{padding:8px 12px;border-bottom:1px solid var(--border);font-size:13px;white-space:nowrap}
 .report-table tr:last-child td{border-bottom:none}
 .report-table tr:hover td{background:var(--surface2)}
 .report-expense-row td{background:var(--red-lt);color:#991B1B;font-style:italic}
 .report-day-foot{background:var(--surface2);padding:10px 14px;display:flex;flex-wrap:wrap;gap:14px;font-size:12px;border-top:1px solid var(--border)}
 .report-net{color:var(--green);font-weight:700}
-.report-summary{background:var(--text);color:#fff;border-radius:var(--radius);padding:18px;margin-top:16px}
+.report-summary{background:#00274C;color:#fff;border-radius:var(--radius);padding:18px;margin-top:16px}
 .report-summary h3{color:var(--amber);margin-bottom:14px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.07em}
 .summary-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px}
 .summary-item{background:rgba(255,255,255,.06);border-radius:var(--radius-sm);padding:10px 12px}
@@ -597,7 +1190,7 @@ select.field-input{cursor:pointer}
 .warning-text{font-size:12px;color:#92400E;background:var(--amber-lt);border-radius:var(--radius-sm);padding:8px 10px;margin-bottom:10px;border:1px solid #FDE68A}
 .divider{border:none;border-top:1px solid var(--border);margin:18px 0}
 .mt-2{margin-top:8px}.mt-4{margin-top:16px}.mb-4{margin-bottom:16px}
-.toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:var(--text);color:#fff;padding:11px 22px;border-radius:var(--radius-xl);font-size:13.5px;font-weight:600;box-shadow:var(--shadow-lg);z-index:9999;pointer-events:none;letter-spacing:-.1px}
+.toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:#00274C;color:#FFCB05;padding:11px 22px;border-radius:var(--radius-xl);font-size:13.5px;font-weight:600;box-shadow:var(--shadow-lg);z-index:9999;pointer-events:none;letter-spacing:-.1px}
 .setup-page{display:flex;align-items:center;justify-content:center;min-height:calc(100vh - 60px);padding:40px 20px}
 .setup-card{background:var(--surface);border-radius:var(--radius-xl);box-shadow:var(--shadow-lg);padding:40px;width:100%;max-width:480px;border:1px solid var(--border)}
 .setup-icon{font-size:44px;text-align:center;margin-bottom:16px}
@@ -626,6 +1219,34 @@ select.field-input{cursor:pointer}
 .shift-saved-row:last-child{border-bottom:none}
 .shift-saved-row span{color:var(--text3)}
 .shift-saved-row strong{color:var(--text)}
+.auth-page{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:40px 20px;background:linear-gradient(135deg,#00274C 0%,#003366 100%)}
+.auth-card{background:var(--surface);border-radius:var(--radius-xl);box-shadow:var(--shadow-lg);padding:40px;width:100%;max-width:400px;border:1px solid var(--border)}
+.auth-error{background:var(--red-lt);color:#991B1B;border:1px solid #FECACA;border-radius:var(--radius-sm);padding:10px 14px;font-size:13px;font-weight:600;margin-bottom:16px;text-align:center}
+.auth-success{background:var(--green-lt);color:#065F46;border:1px solid #A7F3D0;border-radius:var(--radius-sm);padding:10px 14px;font-size:13px;font-weight:600;margin-bottom:16px;text-align:center}
+.reset-url-box{background:#F8FAFC;border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px;margin-bottom:16px}
+.reset-url-box textarea{width:100%;font-family:monospace;font-size:12px;border:1px solid var(--border);border-radius:4px;padding:8px;resize:none;background:#fff;box-sizing:border-box}
+.auth-foot{text-align:center;font-size:13px;color:var(--text3);margin-top:18px}
+.auth-link{color:var(--amber-d);font-weight:600;text-decoration:none}
+.auth-link:hover{text-decoration:underline}
+.admin-page{max-width:900px;margin:0 auto;padding:24px 12px}
+@media(min-width:600px){.admin-page{padding:32px 20px}}
+.admin-section{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);margin-bottom:20px;overflow:hidden}
+.admin-section-header{padding:14px 16px;background:var(--surface2);border-bottom:1px solid var(--border);font-weight:700;font-size:14px;color:var(--text)}
+.admin-table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.admin-table{width:100%;border-collapse:collapse;font-size:13px;min-width:480px}
+.admin-table th{padding:9px 12px;text-align:left;font-weight:600;color:var(--text2);background:var(--surface2);border-bottom:1px solid var(--border);white-space:nowrap}
+.admin-table td{padding:9px 12px;border-bottom:1px solid var(--border);vertical-align:middle;white-space:nowrap}
+.admin-table tr:last-child td{border-bottom:none}
+.admin-table tr:hover td{background:var(--amber-xl)}
+.admin-badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:20px}
+.badge-driver{background:var(--blue-lt);color:#1e40af}
+.badge-admin{background:var(--amber-lt);color:#92400e}
+.badge-inactive{background:var(--red-lt);color:#991b1b}
+.admin-actions{display:flex;gap:6px;flex-wrap:wrap}
+.admin-stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px;padding:16px}
+.admin-stat{background:var(--surface2);border-radius:var(--radius);padding:14px;text-align:center}
+.admin-stat-val{font-size:22px;font-weight:800;color:var(--amber-d)}
+.admin-stat-label{font-size:11px;color:var(--text3);margin-top:4px}
 .clk-input{cursor:pointer;caret-color:transparent}
 #clk-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center}
 #clk-popup{background:#fff;border-radius:var(--radius-xl);padding:22px 20px 16px;width:250px;box-shadow:var(--shadow-lg);border:1px solid var(--border)}
@@ -647,6 +1268,15 @@ select.field-input{cursor:pointer}
 # ════════════════════════════════════════════════════════════════
 
 JS = """/* app.js */
+(function(){
+  const _f=window.fetch;
+  window.fetch=async function(...a){
+    const r=await _f(...a);
+    if(r.status===401){window.location.href='/login';return r;}
+    return r;
+  };
+})();
+
 function fmt(v){return '$'+(parseFloat(v)||0).toFixed(2)}
 
 /* 12h ↔ 24h helpers for Clocklet */
@@ -837,9 +1467,25 @@ async function lookupByPhone(){
 document.addEventListener('click',e=>{if(!e.target.closest('.autocomplete-wrap'))clearAC()});
 
 /* --- Pickup form --- */
+function autoTipPm(){
+  const tip=parseFloat(document.getElementById('tip').value)||0;
+  const tpm=document.getElementById('tip_payment_method');
+  if(tip>0&&!tpm.value){
+    const pm=document.getElementById('payment_method').value;
+    if(pm)tpm.value=pm;
+  }
+}
+
 async function submitPickup(e){
   e.preventDefault();
   const f=e.target;
+  const meter=parseFloat(f.meter_total.value)||0;
+  const tip=parseFloat(f.tip.value)||0;
+  if(meter>0&&!f.payment_method.value){showToast('Please select a Payment method');return;}
+  if(tip>0&&!f.tip_payment_method.value){
+    if(f.payment_method.value){f.tip_payment_method.value=f.payment_method.value;}
+    else{showToast('Please select a Tip Payment method');return;}
+  }
   const data={
     pickup_date:f.pickup_date.value,pickup_time:to24h(f.pickup_time.value),
     street_address:f.street_address.value,city:f.city.value,
@@ -948,9 +1594,12 @@ function renderTotals(t){
   if(grid)grid.innerHTML=cells.map(([l,v])=>
     '<div class="total-cell"><div class="total-cell-label">'+l+'</div><div class="total-cell-val">'+v+'</div></div>'
   ).join('');
-  const net=t.net_earnings!==undefined?t.net_earnings:t.owed_driver;
-  if(owedEl)owedEl.textContent=fmt(net);
-  if(owedLabel)owedLabel.textContent=hasExp?'Net After Expenses':'Owed Driver';
+  if(owedEl)owedEl.textContent=fmt(t.owed_driver);
+  if(owedLabel)owedLabel.textContent='Owed Driver';
+  const earningsBar=document.getElementById('earningsBar');
+  const earningsVal=document.getElementById('earningsVal');
+  if(earningsVal)earningsVal.textContent=fmt(t.driver_earnings!==undefined?t.driver_earnings:t.owed_driver);
+  if(earningsBar)earningsBar.style.display='flex';
   tp.style.display='block';
 }
 
@@ -996,6 +1645,15 @@ document.addEventListener('click',async e=>{
   const btn=e.target.closest('[data-action="save-edit"]');
   if(!btn)return;
   const id=btn.dataset.id;
+  const eMeter=parseFloat(document.getElementById('e_meter').value)||0;
+  const eTip=parseFloat(document.getElementById('e_tip').value)||0;
+  const ePm=document.getElementById('e_pm');
+  const eTpm=document.getElementById('e_tpm');
+  if(eMeter>0&&!ePm.value){showToast('Please select a Payment method');return;}
+  if(eTip>0&&!eTpm.value){
+    if(ePm.value){eTpm.value=ePm.value;}
+    else{showToast('Please select a Tip Payment method');return;}
+  }
   const data={
     pickup_date:document.getElementById('e_date').value,
     pickup_time:to24h(document.getElementById('e_time').value),
@@ -1230,10 +1888,10 @@ function renderReport(data){
       +'<div class="report-day-hdr"><span style="font-weight:700">'+day.date+'</span>'
         +'<span style="font-size:12px;color:rgba(255,255,255,.5)">'+t.count+' pickups &nbsp;|&nbsp; '+fmt(t.grand_total)+'</span></div>'
       +(shiftBar?'<div class="report-shift-bar">'+shiftBar+'</div>':'')
-      +'<table class="report-table"><thead><tr>'
+      +'<div style="overflow-x:auto;-webkit-overflow-scrolling:touch"><table class="report-table"><thead><tr>'
         +'<th>Time</th><th>From</th><th>To</th><th>Customer</th>'
         +'<th>Meter</th><th>Pay</th><th>Tip</th><th>Total</th>'
-      +'</tr></thead><tbody>'+rows+expRows+'</tbody></table>'
+      +'</tr></thead><tbody>'+rows+expRows+'</tbody></table></div>'
       +'<div class="report-day-foot">'
         +'<span>Cash: '+fmt(t.meter_cash)+'</span>'
         +'<span>Credit: '+fmt(t.meter_credit)+'</span>'
@@ -1241,7 +1899,7 @@ function renderReport(data){
         +'<span>Tips: '+fmt(t.tip_cash+t.tip_credit+t.tip_voucher)+'</span>'
         +(t.expense_total>0?'<span style="color:var(--red)">Expenses: −'+fmt(t.expense_total)+'</span>':'')
         +'<strong>Owed: '+fmt(t.owed_driver)+'</strong>'
-        +(t.expense_total>0?'<strong class="report-net">Net: '+fmt(t.net_earnings)+'</strong>':'')
+        +'<strong class="report-net">Earnings: '+fmt(t.driver_earnings!==undefined?t.driver_earnings:t.owed_driver)+'</strong>'
       +'</div>'
     +'</div>';
   }).join('');
@@ -1249,9 +1907,9 @@ function renderReport(data){
   const summaryItems=[
     ['Pickups',s.count,false],['Cash Meter',fmt(s.meter_cash),false],
     ['Credit Meter',fmt(s.meter_credit),false],['Voucher Meter',fmt(s.meter_voucher),false],
-    ['Credit Tips',fmt(s.tip_credit),false],['Voucher Tips',fmt(s.tip_voucher),false],
+    ['Cash Tips',fmt(s.tip_cash),false],['Credit Tips',fmt(s.tip_credit),false],['Voucher Tips',fmt(s.tip_voucher),false],
     ['Grand Total',fmt(s.grand_total),false],['Total Expenses',fmt(s.expense_total||0),false],
-    ['Owed Driver',fmt(s.owed_driver),true],['Net Earnings',fmt(s.net_earnings||s.owed_driver),'net'],
+    ['Owed Driver',fmt(s.owed_driver),true],['Earnings',fmt(s.driver_earnings!==undefined?s.driver_earnings:s.owed_driver),'net'],
   ];
   out.innerHTML=dayBlocks
     +'<div class="report-summary"><h3>Summary — '+modeLabel+'</h3><div class="summary-grid">'
@@ -1282,52 +1940,21 @@ function downloadReportPDF(){
 }
 
 /* --- Full backup with Save As dialog --- */
-async function saveFullBackup(){
-  const fname='taxilog_backup_'+new Date().toISOString().slice(0,10)+'.zip';
-  if('showSaveFilePicker' in window){
-    try{
-      const handle=await window.showSaveFilePicker({
-        suggestedName:fname,
-        types:[{description:'ZIP Backup',accept:{'application/zip':['.zip']}}],
-      });
-      showToast('Saving…',60000);
-      const blob=await(await fetch('/api/backup/all')).blob();
-      const w=await handle.createWritable();
-      await w.write(blob);await w.close();
-      showToast('Backup saved');
-    }catch(e){if(e.name!=='AbortError')showToast('Save failed');}
-  }else{
-    const a=document.createElement('a');
-    a.href='/api/backup/all';a.download=fname;a.click();
-  }
-}
 
 /* --- Full restore with Open File dialog --- */
 async function restoreFromZip(){
-  const doRestore=async(file)=>{
-    if(!confirm('Restore all data from "'+file.name+'"?\\nThis overwrites all existing data and cannot be undone.'))return;
-    const form=new FormData();form.append('file',file);
-    const r=await fetch('/api/restore/all',{method:'POST',body:form});
-    if(r.ok){
-      const d=await r.json();
-      showToast('Restored '+d.restored.length+' files successfully');
-      closeModal('backupModal');loadDailyLog();
-    }else{
-      const err=await r.json().catch(()=>({}));
-      showToast(err.detail||'Restore failed');
-    }
-  };
-  if('showOpenFilePicker' in window){
-    try{
-      const [handle]=await window.showOpenFilePicker({
-        types:[{description:'ZIP Backup',accept:{'application/zip':['.zip']}}],
-      });
-      await doRestore(await handle.getFile());
-    }catch(e){if(e.name!=='AbortError')showToast('No file selected');}
+  const input=document.getElementById('restoreZip');
+  if(!input.files.length){showToast('Select a ZIP file first');return;}
+  const file=input.files[0];
+  const form=new FormData();form.append('file',file);
+  const r=await fetch('/api/restore/all',{method:'POST',body:form});
+  if(r.ok){
+    const d=await r.json();
+    showToast('Restored '+d.restored.length+' files successfully');
+    closeModal('backupModal');loadDailyLog();
   }else{
-    const input=document.getElementById('restoreZip');
-    input.onchange=async()=>{if(input.files.length)await doRestore(input.files[0]);input.value='';};
-    input.click();
+    const err=await r.json().catch(()=>({}));
+    showToast(err.detail||'Restore failed');
   }
 }
 
@@ -1351,11 +1978,17 @@ async function restoreFile(type){
 
 # ── write assets to disk (always refresh) ───────────────────────
 _ASSETS = {
-    "templates/base.html":  BASE_HTML,
-    "templates/index.html": INDEX_HTML,
-    "templates/setup.html": SETUP_HTML,
-    "static/css/style.css": CSS,
-    "static/js/app.js":     JS,
+    "templates/base.html":          BASE_HTML,
+    "templates/index.html":         INDEX_HTML,
+    "templates/setup.html":         SETUP_HTML,
+    "templates/login.html":         LOGIN_HTML,
+    "templates/register.html":      REGISTER_HTML,
+    "templates/admin.html":         ADMIN_HTML,
+    "templates/admin_register.html": ADMIN_REGISTER_HTML,
+    "templates/admin_reset.html":   ADMIN_RESET_HTML,
+    "templates/reset_password.html": RESET_PASSWORD_HTML,
+    "static/css/style.css":         CSS,
+    "static/js/app.js":             JS,
 }
 for _rel, _content in _ASSETS.items():
     _p = BASE_DIR / _rel
@@ -1366,39 +1999,168 @@ for _rel, _content in _ASSETS.items():
 # HELPERS
 # ════════════════════════════════════════════════════════════════
 
-_GCS_BUCKET = os.environ.get("GCS_BUCKET")
+_GCS_BUCKET   = os.environ.get("GCS_BUCKET")
+_SECRET_KEY   = os.environ.get("SECRET_KEY", "dev-only-insecure-key")
+_ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
+_signer       = URLSafeTimedSerializer(_SECRET_KEY)
+_SESSION_MAX  = 86400 * 30   # 30-day sessions
+_VIEW_MAX     = 3600 * 4     # 4-hour impersonation window
+_RESET_MAX    = 3600         # 1-hour reset tokens
+_reset_tokens: dict[str, str] = {}  # token → user_id
+
+@dataclass
+class AuthCtx:
+    user_id: str
+    role: str           # "driver" | "admin"
+    effective_id: str   # own ID, or driver ID being viewed
+    is_impersonating: bool
+    viewed_name: str
+
+def _hash_pw(password: str) -> str:
+    return _bcrypt_lib.hashpw(password.encode(), _bcrypt_lib.gensalt()).decode()
+
+def _check_pw(password: str, hashed: str) -> bool:
+    return _bcrypt_lib.checkpw(password.encode(), hashed.encode())
 
 def _gcs_client():
     from google.cloud import storage
     return storage.Client()
 
-def _read(path: Path):
+def _blob(name: str, driver_id: str = "") -> str:
+    return f"{driver_id}/{name}" if driver_id else name
+
+def _local(path: Path, driver_id: str = "") -> Path:
+    if driver_id:
+        p = path.parent / driver_id / path.name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+    return path
+
+def _read(path: Path, driver_id: str = ""):
     if _GCS_BUCKET:
         try:
-            blob = _gcs_client().bucket(_GCS_BUCKET).blob(path.name)
+            blob = _gcs_client().bucket(_GCS_BUCKET).blob(_blob(path.name, driver_id))
             if not blob.exists(): return []
             return json.loads(blob.download_as_text())
         except Exception: return []
-    if not path.exists(): return []
-    with open(path) as f: return json.load(f)
+    p = _local(path, driver_id)
+    if not p.exists(): return []
+    with open(p) as f: return json.load(f)
 
-def _write(path: Path, data):
+def _write(path: Path, data, driver_id: str = ""):
     if _GCS_BUCKET:
-        blob = _gcs_client().bucket(_GCS_BUCKET).blob(path.name)
+        blob = _gcs_client().bucket(_GCS_BUCKET).blob(_blob(path.name, driver_id))
         blob.upload_from_string(json.dumps(data, indent=2, default=str),
                                 content_type="application/json")
         return
-    with open(path, "w") as f: json.dump(data, f, indent=2, default=str)
+    p = _local(path, driver_id)
+    with open(p, "w") as f: json.dump(data, f, indent=2, default=str)
 
-def _read_profile():
+def _read_profile(driver_id: str = ""):
     if _GCS_BUCKET:
         try:
-            blob = _gcs_client().bucket(_GCS_BUCKET).blob(PROFILE_F.name)
+            blob = _gcs_client().bucket(_GCS_BUCKET).blob(_blob(PROFILE_F.name, driver_id))
             if not blob.exists(): return {}
             return json.loads(blob.download_as_text())
         except Exception: return {}
-    if not PROFILE_F.exists(): return {}
-    with open(PROFILE_F) as f: return json.load(f)
+    p = _local(PROFILE_F, driver_id)
+    if not p.exists(): return {}
+    with open(p) as f: return json.load(f)
+
+# ── users (no driver namespace — stored at root) ─────────────────
+
+def _read_users() -> list:
+    if _GCS_BUCKET:
+        try:
+            blob = _gcs_client().bucket(_GCS_BUCKET).blob("users.json")
+            if not blob.exists(): return []
+            return json.loads(blob.download_as_text())
+        except Exception: return []
+    p = DATA_DIR / "users.json"
+    if not p.exists(): return []
+    with open(p) as f: return json.load(f)
+
+def _write_users(users: list):
+    if _GCS_BUCKET:
+        blob = _gcs_client().bucket(_GCS_BUCKET).blob("users.json")
+        blob.upload_from_string(json.dumps(users, indent=2, default=str),
+                                content_type="application/json")
+        return
+    p = DATA_DIR / "users.json"
+    with open(p, "w") as f: json.dump(users, f, indent=2, default=str)
+
+# ── session helpers ──────────────────────────────────────────────
+
+def _get_auth_ctx(request: Request) -> Optional[AuthCtx]:
+    token = request.cookies.get("txl_sess")
+    if not token: return None
+    try:
+        payload = _signer.loads(token, max_age=_SESSION_MAX)
+    except Exception:
+        return None
+    # backward-compat: old cookies stored plain driver_id string
+    if isinstance(payload, str):
+        return AuthCtx(user_id=payload, role="driver", effective_id=payload,
+                       is_impersonating=False, viewed_name="")
+    uid  = payload.get("uid", "")
+    role = payload.get("role", "driver")
+    if not uid: return None
+    # check impersonation cookie (admin only)
+    view_ctx = None
+    if role == "admin":
+        vtoken = request.cookies.get("txl_view")
+        if vtoken:
+            try: view_ctx = _signer.loads(vtoken, max_age=_VIEW_MAX)
+            except Exception: view_ctx = None
+    if view_ctx:
+        return AuthCtx(user_id=uid, role=role,
+                       effective_id=view_ctx.get("driver_id", uid),
+                       is_impersonating=True,
+                       viewed_name=view_ctx.get("driver_name", ""))
+    return AuthCtx(user_id=uid, role=role, effective_id=uid,
+                   is_impersonating=False, viewed_name="")
+
+def _set_cookie(response: Response, user_id: str, role: str = "driver"):
+    token = _signer.dumps({"uid": user_id, "role": role})
+    response.set_cookie("txl_sess", token, max_age=_SESSION_MAX,
+                        httponly=True, samesite="lax", secure=bool(_GCS_BUCKET))
+
+def _set_view_cookie(response: Response, driver_id: str, driver_name: str):
+    token = _signer.dumps({"driver_id": driver_id, "driver_name": driver_name})
+    response.set_cookie("txl_view", token, max_age=_VIEW_MAX,
+                        httponly=True, samesite="lax", secure=bool(_GCS_BUCKET))
+
+def _clear_cookie(response: Response):
+    response.delete_cookie("txl_sess")
+    response.delete_cookie("txl_view")
+
+def _ctx_tmpl(ctx: Optional[AuthCtx]) -> dict:
+    if not ctx:
+        return {"user_id": None, "role": None, "is_impersonating": False, "viewed_name": ""}
+    return {"user_id": ctx.user_id, "role": ctx.role,
+            "is_impersonating": ctx.is_impersonating, "viewed_name": ctx.viewed_name}
+
+# ── data migration (flat → namespaced, first registration only) ──
+
+def _migrate_flat_data(driver_id: str):
+    names = ["pickups.json","customers.json","expenses.json","shifts.json","profile.json"]
+    if _GCS_BUCKET:
+        client  = _gcs_client()
+        bucket  = client.bucket(_GCS_BUCKET)
+        for name in names:
+            old = bucket.blob(name)
+            if old.exists():
+                new_name = f"{driver_id}/{name}"
+                if not bucket.blob(new_name).exists():
+                    bucket.copy_blob(old, bucket, new_name)
+                old.delete()
+    else:
+        for name in names:
+            old = DATA_DIR / name
+            new = DATA_DIR / driver_id / name
+            (DATA_DIR / driver_id).mkdir(exist_ok=True)
+            if old.exists() and not new.exists():
+                old.rename(new)
 
 def owed_driver_amount(t: dict, profile: dict) -> float:
     mode = (profile or {}).get("pay_mode", "standard")
@@ -1406,7 +2168,10 @@ def owed_driver_amount(t: dict, profile: dict) -> float:
     tc, tcr, tv = t["tip_cash"], t["tip_credit"], t["tip_voucher"]
     gt = t["grand_total"]
     if mode == "gate":
-        return round(gt - float((profile or {}).get("gate_fee") or 0), 2)
+        if t.get("count", 0) == 0:
+            return 0.0
+        gate_fee = float((profile or {}).get("gate_fee") or 0)
+        return round((mcr + mv) / 2 + tcr + tv - gate_fee, 2)
     elif mode == "commission":
         pct = float((profile or {}).get("company_pct") or 50) / 100
         all_meter = mc + mcr + mv
@@ -1440,9 +2205,9 @@ def day_totals(recs, profile=None):
 def calc_total(meter: float, tip: float) -> float:
     return round((meter or 0) + (tip or 0), 2)
 
-def upsert_customer(name, address, city, phone):
+def upsert_customer(name, address, city, phone, driver_id: str = ""):
     if not name: return
-    customers = _read(CUSTOMERS_F)
+    customers = _read(CUSTOMERS_F, driver_id)
     match = None
     if phone: match = next((c for c in customers if c.get("phone") == phone), None)
     if not match: match = next((c for c in customers if c.get("name","").lower() == name.lower()), None)
@@ -1454,7 +2219,7 @@ def upsert_customer(name, address, city, phone):
     else:
         customers.append({"id": str(uuid.uuid4()), "name": name,
                           "street_address": address or "", "city": city or "", "phone": phone or ""})
-    _write(CUSTOMERS_F, customers)
+    _write(CUSTOMERS_F, customers, driver_id)
 
 # ════════════════════════════════════════════════════════════════
 # APP
@@ -1476,17 +2241,526 @@ def _tmpl(name, request, ctx):
         return templates.TemplateResponse(request, name, ctx)
     return templates.TemplateResponse(name, {"request": request, **ctx})
 
+# ── auth routes ──────────────────────────────────────────────────
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    ctx = _get_auth_ctx(request)
+    if ctx: return RedirectResponse("/admin" if ctx.role == "admin" else "/", status_code=303)
+    success = "Password reset successfully. Please sign in." if request.query_params.get("reset") == "1" else None
+    return _tmpl("login.html", request, {"error": None, "success": success, "allow_register": True})
+
+@app.post("/login", response_class=HTMLResponse)
+async def login_submit(request: Request,
+                       username: str = Form(...),
+                       password: str = Form(...)):
+    users = _read_users()
+    user  = next((u for u in users if u["username"].lower() == username.lower()), None)
+    if not user or not _check_pw(password, user["password_hash"]):
+        return _tmpl("login.html", request, {"error": "Invalid username or password.", "allow_register": True})
+    if not user.get("active", True):
+        return _tmpl("login.html", request, {"error": "This account has been deactivated.", "allow_register": True})
+    role = user.get("role", "driver")
+    dest = "/admin" if role == "admin" else "/"
+    resp = RedirectResponse(dest, status_code=303)
+    _set_cookie(resp, user["id"], role)
+    return resp
+
+@app.get("/register", response_class=HTMLResponse)
+async def register_page(request: Request):
+    ctx = _get_auth_ctx(request)
+    if ctx: return RedirectResponse("/admin" if ctx.role == "admin" else "/", status_code=303)
+    return _tmpl("register.html", request, {"error": None, "is_first": len(_read_users()) == 0})
+
+@app.post("/register", response_class=HTMLResponse)
+async def register_submit(request: Request,
+                          username: str = Form(...),
+                          password: str = Form(...),
+                          confirm:  str = Form(...)):
+    users = _read_users()
+    if password != confirm:
+        return _tmpl("register.html", request, {"error": "Passwords do not match.", "is_first": len(users) == 0})
+    if len(password) < 6:
+        return _tmpl("register.html", request, {"error": "Password must be at least 6 characters.", "is_first": len(users) == 0})
+    if any(u["username"].lower() == username.lower() for u in users):
+        return _tmpl("register.html", request, {"error": "Username already taken.", "is_first": len(users) == 0})
+    is_first = len(users) == 0
+    new_user = {"id": str(uuid.uuid4()), "username": username,
+                "password_hash": _hash_pw(password), "role": "driver", "active": True,
+                "created_at": datetime.utcnow().isoformat()}
+    users.append(new_user)
+    _write_users(users)
+    if is_first:
+        _migrate_flat_data(new_user["id"])
+    resp = RedirectResponse("/setup" if is_first else "/", status_code=303)
+    _set_cookie(resp, new_user["id"], "driver")
+    return resp
+
+@app.post("/logout")
+async def logout():
+    resp = RedirectResponse("/login", status_code=303)
+    _clear_cookie(resp)
+    return resp
+
+@app.get("/admin/reset", response_class=HTMLResponse)
+async def admin_reset_get(request: Request):
+    return _tmpl("admin_reset.html", request, {"error": None, "reset_url": None})
+
+@app.post("/admin/reset", response_class=HTMLResponse)
+async def admin_reset_post(request: Request, username: str = Form(...)):
+    def err(msg):
+        return _tmpl("admin_reset.html", request, {"error": msg, "reset_url": None})
+    if not username.strip():
+        return err("Username is required.")
+    users = _read_users()
+    user = next((u for u in users if u["username"].lower() == username.lower()), None)
+    if not user:
+        return err(f"Username '{username}' not found.")
+    token = _signer.dumps(user["id"], salt="password-reset")
+    _reset_tokens[token] = user["id"]
+    reset_url = str(request.base_url).rstrip("/") + f"/reset-password?token={token}"
+    return _tmpl("admin_reset.html", request, {"error": None, "reset_url": reset_url})
+
+@app.get("/reset-password", response_class=HTMLResponse)
+async def reset_password_get(request: Request):
+    token = request.query_params.get("token", "")
+    def err(msg):
+        return _tmpl("reset_password.html", request, {"error": msg, "token": "", "form_error": None})
+    if not token:
+        return err("No reset token provided.")
+    if token not in _reset_tokens:
+        return err("This link is invalid or has already been used.")
+    try:
+        _signer.loads(token, salt="password-reset", max_age=_RESET_MAX)
+    except SignatureExpired:
+        _reset_tokens.pop(token, None)
+        return err("This link has expired (1-hour limit). Please generate a new one.")
+    except BadSignature:
+        return err("This link is invalid.")
+    return _tmpl("reset_password.html", request, {"error": None, "token": token, "form_error": None})
+
+@app.post("/reset-password", response_class=HTMLResponse)
+async def reset_password_post(request: Request,
+        token: str = Form(...), new_password: str = Form(...), new_password2: str = Form(...)):
+    def link_err(msg):
+        return _tmpl("reset_password.html", request, {"error": msg, "token": "", "form_error": None})
+    def form_err(msg):
+        return _tmpl("reset_password.html", request, {"error": None, "token": token, "form_error": msg})
+    if token not in _reset_tokens:
+        return link_err("This link is invalid or has already been used.")
+    try:
+        uid = _signer.loads(token, salt="password-reset", max_age=_RESET_MAX)
+    except SignatureExpired:
+        _reset_tokens.pop(token, None)
+        return link_err("This link has expired. Please generate a new one.")
+    except BadSignature:
+        return link_err("This link is invalid.")
+    users = _read_users()
+    user = next((u for u in users if u["id"] == uid), None)
+    if not user:
+        _reset_tokens.pop(token, None)
+        return link_err("User account not found.")
+    if len(new_password) < 6:
+        return form_err("Password must be at least 6 characters.")
+    if new_password != new_password2:
+        return form_err("Passwords do not match.")
+    user["password_hash"] = _hash_pw(new_password)
+    _write_users(users)
+    for t in list(_reset_tokens.keys()):
+        if _reset_tokens[t] == uid:
+            del _reset_tokens[t]
+    return RedirectResponse("/login?reset=1", status_code=303)
+
+@app.post("/api/change-password")
+async def change_password(request: Request):
+    ctx = _get_auth_ctx(request)
+    if not ctx: raise HTTPException(401, "Not authenticated")
+    body = await request.json()
+    current_pw = body.get("current_password", "")
+    new_pw     = body.get("new_password", "")
+    if len(new_pw) < 6:
+        raise HTTPException(400, "New password must be at least 6 characters.")
+    users = _read_users()
+    user  = next((u for u in users if u["id"] == ctx.user_id), None)
+    if not user or not _check_pw(current_pw, user["password_hash"]):
+        raise HTTPException(400, "Current password is incorrect.")
+    user["password_hash"] = _hash_pw(new_pw)
+    _write_users(users)
+    return {"ok": True}
+
+# ── admin routes ─────────────────────────────────────────────────
+
+@app.get("/admin/register", response_class=HTMLResponse)
+async def admin_register_page(request: Request):
+    if not _ADMIN_SECRET:
+        raise HTTPException(404, "Not found")
+    ctx = _get_auth_ctx(request)
+    if ctx and ctx.role == "admin": return RedirectResponse("/admin", status_code=303)
+    return _tmpl("admin_register.html", request, {"error": None})
+
+@app.post("/admin/register", response_class=HTMLResponse)
+async def admin_register_submit(request: Request,
+                                username:     str = Form(...),
+                                password:     str = Form(...),
+                                confirm:      str = Form(...),
+                                admin_secret: str = Form(...)):
+    if not _ADMIN_SECRET:
+        raise HTTPException(404, "Not found")
+    if admin_secret != _ADMIN_SECRET:
+        return _tmpl("admin_register.html", request, {"error": "Invalid admin secret key."})
+    users = _read_users()
+    if password != confirm:
+        return _tmpl("admin_register.html", request, {"error": "Passwords do not match."})
+    if len(password) < 6:
+        return _tmpl("admin_register.html", request, {"error": "Password must be at least 6 characters."})
+    if any(u["username"].lower() == username.lower() for u in users):
+        return _tmpl("admin_register.html", request, {"error": "Username already taken."})
+    new_user = {"id": str(uuid.uuid4()), "username": username,
+                "password_hash": _hash_pw(password), "role": "admin", "active": True,
+                "created_at": datetime.utcnow().isoformat()}
+    users.append(new_user)
+    _write_users(users)
+    resp = RedirectResponse("/admin", status_code=303)
+    _set_cookie(resp, new_user["id"], "admin")
+    return resp
+
+def _admin_dashboard_data(ctx: AuthCtx) -> dict:
+    users = _read_users()
+    active_drivers, inactive_drivers, admins = [], [], []
+    for u in users:
+        role   = u.get("role", "driver")
+        active = u.get("active", True)
+        profile = _read_profile(u["id"])
+        entry = {**u, "profile_name": profile.get("driver_name", "") if profile else ""}
+        if role == "admin":
+            admins.append(entry)
+        elif active:
+            active_drivers.append(entry)
+        else:
+            inactive_drivers.append(entry)
+
+    today_str = date.today().isoformat()
+    today_rows = []
+    fleet_today = {"count":0,"meter":0.0,"tips":0.0,"grand_total":0.0,
+                   "owed_driver":0.0,"expense_total":0.0,"driver_earnings":0.0}
+    for driver in active_drivers:
+        profile_obj   = _read_profile(driver["id"])
+        pickups_today = [p for p in _read(PICKUPS_F, driver["id"]) if p.get("pickup_date") == today_str]
+        expenses_today= [e for e in _read(EXPENSES_F, driver["id"]) if e.get("date") == today_str]
+        t = day_totals(pickups_today, profile_obj)
+        exp_total  = round(sum(e["amount"] for e in expenses_today), 2)
+        meter_tot  = round(t["meter_cash"] + t["meter_credit"] + t["meter_voucher"], 2)
+        tip_tot    = round(t["tip_cash"]   + t["tip_credit"]   + t["tip_voucher"],   2)
+        earnings   = round(t["owed_driver"] + t["meter_cash"] + t["tip_cash"] - exp_total, 2)
+        today_rows.append({"driver_name": driver["profile_name"] or driver["username"],
+                           "count": t["count"], "meter_total": meter_tot, "tip_total": tip_tot,
+                           "grand_total": t["grand_total"], "owed_driver": t["owed_driver"],
+                           "expense_total": exp_total, "driver_earnings": earnings})
+        fleet_today["count"]          += t["count"]
+        fleet_today["meter"]          += meter_tot
+        fleet_today["tips"]           += tip_tot
+        fleet_today["grand_total"]    += t["grand_total"]
+        fleet_today["owed_driver"]    += t["owed_driver"]
+        fleet_today["expense_total"]  += exp_total
+        fleet_today["driver_earnings"]+= earnings
+    fleet_today = {k: round(v, 2) if isinstance(v, float) else v for k, v in fleet_today.items()}
+
+    return {
+        "active_drivers": active_drivers,
+        "inactive_drivers": inactive_drivers,
+        "admins": admins,
+        "current_user_id": ctx.user_id,
+        "admin_secret_set": bool(_ADMIN_SECRET),
+        "today_str": today_str,
+        "today_rows": today_rows,
+        "fleet_today": fleet_today,
+        "msg": None, "msg_type": "ok",
+    }
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_dashboard(request: Request):
+    ctx = _require_admin(request)
+    data = _admin_dashboard_data(ctx)
+    return _tmpl("admin.html", request, {**data, **_ctx_tmpl(ctx)})
+
+@app.get("/admin/view/{driver_id}", response_class=HTMLResponse)
+async def admin_view_driver(driver_id: str, request: Request):
+    ctx = _require_admin(request)
+    users = _read_users()
+    user = next((u for u in users if u["id"] == driver_id and u.get("role","driver") == "driver"), None)
+    if not user: raise HTTPException(404, "Driver not found")
+    profile = _read_profile(driver_id)
+    driver_name = profile.get("driver_name", user["username"]) if profile else user["username"]
+    resp = RedirectResponse("/", status_code=303)
+    _set_view_cookie(resp, driver_id, driver_name)
+    return resp
+
+@app.post("/admin/exit-view")
+async def admin_exit_view(request: Request):
+    ctx = _get_auth_ctx(request)
+    if not ctx or ctx.role != "admin":
+        return RedirectResponse("/login", status_code=303)
+    resp = RedirectResponse("/admin", status_code=303)
+    resp.delete_cookie("txl_view")
+    return resp
+
+@app.post("/admin/deactivate/{user_id}")
+async def admin_deactivate(user_id: str, request: Request):
+    ctx = _require_admin(request)
+    if user_id == ctx.user_id:
+        raise HTTPException(400, "Cannot deactivate your own account.")
+    users = _read_users()
+    user = next((u for u in users if u["id"] == user_id), None)
+    if not user: raise HTTPException(404, "User not found")
+    user["active"] = False
+    _write_users(users)
+    return RedirectResponse("/admin", status_code=303)
+
+@app.post("/admin/reactivate/{user_id}")
+async def admin_reactivate(user_id: str, request: Request):
+    _require_admin(request)
+    users = _read_users()
+    user = next((u for u in users if u["id"] == user_id), None)
+    if not user: raise HTTPException(404, "User not found")
+    user["active"] = True
+    _write_users(users)
+    return RedirectResponse("/admin", status_code=303)
+
+@app.post("/admin/delete/{user_id}")
+async def admin_delete(user_id: str, request: Request):
+    ctx = _require_admin(request)
+    if user_id == ctx.user_id:
+        raise HTTPException(400, "Cannot delete your own account.")
+    users = _read_users()
+    user = next((u for u in users if u["id"] == user_id), None)
+    if not user: raise HTTPException(404, "User not found")
+    if user.get("active", True):
+        raise HTTPException(400, "Deactivate the account before deleting.")
+    # delete their data namespace
+    if _GCS_BUCKET:
+        client = _gcs_client()
+        bucket = client.bucket(_GCS_BUCKET)
+        for blob in list(bucket.list_blobs(prefix=f"{user_id}/")):
+            blob.delete()
+    else:
+        import shutil
+        d = DATA_DIR / user_id
+        if d.exists(): shutil.rmtree(d)
+    users = [u for u in users if u["id"] != user_id]
+    _write_users(users)
+    return RedirectResponse("/admin", status_code=303)
+
+# ── fleet report APIs ────────────────────────────────────────────
+
+def _fleet_report_data(from_date: str, to_date: str) -> dict:
+    users = _read_users()
+    drivers = [u for u in users if u.get("role","driver") == "driver" and u.get("active", True)]
+    result = []
+    summary = {"count":0,"meter_total":0.0,"tip_total":0.0,"grand_total":0.0,
+               "owed_driver":0.0,"expense_total":0.0,"driver_earnings":0.0}
+    for u in drivers:
+        profile_obj  = _read_profile(u["id"])
+        pickups      = _read(PICKUPS_F, u["id"])
+        expenses_all = _read(EXPENSES_F, u["id"])
+        if from_date: pickups      = [p for p in pickups      if p.get("pickup_date","") >= from_date]
+        if to_date:   pickups      = [p for p in pickups      if p.get("pickup_date","") <= to_date]
+        if from_date: expenses_all = [e for e in expenses_all if e.get("date","")        >= from_date]
+        if to_date:   expenses_all = [e for e in expenses_all if e.get("date","")        <= to_date]
+        if not pickups and not expenses_all: continue
+        t = day_totals(pickups, profile_obj)
+        # Gate mode: fee applies once per day with pickups, so sum per-day values
+        if (profile_obj or {}).get("pay_mode","standard") == "gate" and pickups:
+            pmap = {}
+            for p in pickups: pmap.setdefault(p.get("pickup_date",""), []).append(p)
+            t["owed_driver"] = round(sum(day_totals(dp, profile_obj)["owed_driver"] for dp in pmap.values()), 2)
+        exp_total  = round(sum(e["amount"] for e in expenses_all), 2)
+        meter_tot  = round(t["meter_cash"] + t["meter_credit"] + t["meter_voucher"], 2)
+        tip_tot    = round(t["tip_cash"]   + t["tip_credit"]   + t["tip_voucher"],   2)
+        earnings   = round(t["owed_driver"] + t["meter_cash"] + t["tip_cash"] - exp_total, 2)
+        days_worked= len(set(p.get("pickup_date","") for p in pickups))
+        row = {"driver_id": u["id"],
+               "driver_name": profile_obj.get("driver_name","") if profile_obj else u["username"],
+               "days_worked": days_worked, "count": t["count"],
+               "meter_total": meter_tot, "tip_total": tip_tot,
+               "grand_total": round(t["grand_total"],2), "owed_driver": t["owed_driver"],
+               "expense_total": exp_total, "driver_earnings": earnings}
+        result.append(row)
+        for k in ("count","grand_total","owed_driver","expense_total"):
+            summary[k] += row[k]
+        summary["meter_total"]    += meter_tot
+        summary["tip_total"]      += tip_tot
+        summary["driver_earnings"]+= earnings
+    summary = {k: round(v,2) if isinstance(v,float) else v for k,v in summary.items()}
+    summary["driver_count"] = len(result)
+    return {"drivers": result, "summary": summary}
+
+@app.get("/api/admin/fleet-report")
+async def fleet_report_json(request: Request, from_date: str = "", to_date: str = ""):
+    _require_admin(request)
+    return _fleet_report_data(from_date, to_date)
+
+@app.get("/api/admin/fleet-report-pdf")
+async def fleet_report_pdf(request: Request, from_date: str = "", to_date: str = ""):
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+    from reportlab.lib import colors
+    _require_admin(request)
+    data   = _fleet_report_data(from_date, to_date)
+    amber  = colors.HexColor("#D97706")
+    dark   = colors.HexColor("#1C1917")
+    green  = colors.HexColor("#10B981")
+    red    = colors.HexColor("#EF4444")
+    buf    = io.BytesIO()
+    doc    = SimpleDocTemplate(buf, pagesize=letter,
+                               leftMargin=0.75*inch, rightMargin=0.75*inch,
+                               topMargin=0.75*inch,  bottomMargin=0.75*inch)
+    styles = getSampleStyleSheet()
+    h1  = ParagraphStyle("h1", parent=styles["Heading1"], textColor=amber, fontSize=18, spaceAfter=4)
+    body= styles["BodyText"]
+    period = f"{from_date or 'all'} to {to_date or 'all'}"
+    story  = [
+        Paragraph("Taxi Log — Fleet Report", h1),
+        Paragraph(f"Period: {period} &nbsp;|&nbsp; Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}", body),
+        HRFlowable(width="100%", color=amber, thickness=2, spaceAfter=10),
+    ]
+    col_w = [1.4*inch,0.55*inch,0.6*inch,0.85*inch,0.75*inch,0.85*inch,0.85*inch,0.85*inch,0.85*inch]
+    hdr = [["Driver","Days","Trips","Meter","Tips","Gross","Expenses","Owed Driver","Earnings"]]
+    rows = hdr + [[
+        d["driver_name"], str(d["days_worked"]), str(d["count"]),
+        f'${d["meter_total"]:.2f}', f'${d["tip_total"]:.2f}', f'${d["grand_total"]:.2f}',
+        f'${d["expense_total"]:.2f}', f'${d["owed_driver"]:.2f}', f'${d["driver_earnings"]:.2f}'
+    ] for d in data["drivers"]]
+    s = data["summary"]
+    rows.append(["Fleet Total", f'{s["driver_count"]} drivers', str(s["count"]),
+                 f'${s["meter_total"]:.2f}', f'${s["tip_total"]:.2f}', f'${s["grand_total"]:.2f}',
+                 f'${s["expense_total"]:.2f}', f'${s["owed_driver"]:.2f}', f'${s["driver_earnings"]:.2f}'])
+    tbl = Table(rows, colWidths=col_w)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0), amber),
+        ("TEXTCOLOR",(0,0),(-1,0), colors.white),
+        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+        ("BACKGROUND",(0,-1),(-1,-1), colors.HexColor("#FFFBEB")),
+        ("FONTNAME",(0,-1),(-1,-1),"Helvetica-Bold"),
+        ("TEXTCOLOR",(0,-1),(-2,-1), dark),
+        ("TEXTCOLOR",(-1,-1),(-1,-1), green),
+        ("FONTSIZE",(0,0),(-1,-1),8),
+        ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
+        ("ROWBACKGROUNDS",(0,1),(-1,-2),[colors.white, colors.HexColor("#FFFBEB")]),
+        ("GRID",(0,0),(-1,-1),0.4,colors.HexColor("#D1D5DB")),
+        ("LINEABOVE",(0,-1),(-1,-1),1.5,amber),
+    ]))
+    story.append(tbl)
+    doc.build(story); buf.seek(0)
+    label = f"{from_date or 'all'}_to_{to_date or 'all'}"
+    return StreamingResponse(buf, media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=fleet_report_{label}.pdf"})
+
+@app.post("/api/admin/delete-all")
+async def admin_delete_all(request: Request):
+    ctx = _require_admin(request)
+    users = _read_users()
+    drivers = [u for u in users if u.get("role", "driver") != "admin"]
+    admins  = [u for u in users if u.get("role", "driver") == "admin"]
+    if _GCS_BUCKET:
+        client = _gcs_client()
+        bucket = client.bucket(_GCS_BUCKET)
+        for u in drivers:
+            for blob in list(bucket.list_blobs(prefix=f"{u['id']}/")):
+                blob.delete()
+    else:
+        import shutil
+        for u in drivers:
+            d = DATA_DIR / u["id"]
+            if d.exists(): shutil.rmtree(d)
+    _write_users(admins)
+    return {"ok": True, "deleted_drivers": len(drivers)}
+
+@app.get("/api/admin/backup/all")
+async def admin_backup_all(request: Request):
+    _require_admin(request)
+    import zipfile as zf_mod
+    users = _read_users()
+    buf = io.BytesIO()
+    with zf_mod.ZipFile(buf, 'w', zf_mod.ZIP_DEFLATED) as zf:
+        zf.writestr("users.json", json.dumps(users, indent=2, default=str))
+        for u in users:
+            did = u["id"]
+            files = [
+                (PICKUPS_F,   "pickups.json",   False),
+                (CUSTOMERS_F, "customers.json", False),
+                (EXPENSES_F,  "expenses.json",  False),
+                (SHIFTS_F,    "shifts.json",    False),
+                (PROFILE_F,   "profile.json",   True),
+            ]
+            for path, name, is_profile in files:
+                data = _read_profile(did) if is_profile else _read(path, did)
+                zf.writestr(f"{did}/{name}", json.dumps(data or ({} if is_profile else []), indent=2, default=str))
+    buf.seek(0)
+    fname = f"taxilog_fleet_backup_{date.today().isoformat()}.zip"
+    return StreamingResponse(buf, media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+@app.post("/api/admin/restore/all")
+async def admin_restore_all(request: Request, file: UploadFile = File(...)):
+    _require_admin(request)
+    import zipfile as zf_mod
+    file_map = {
+        "pickups.json":   (PICKUPS_F,   True),
+        "customers.json": (CUSTOMERS_F, True),
+        "expenses.json":  (EXPENSES_F,  True),
+        "shifts.json":    (SHIFTS_F,    True),
+        "profile.json":   (PROFILE_F,   False),
+    }
+    try:
+        raw = await file.read()
+        with zf_mod.ZipFile(io.BytesIO(raw)) as zf:
+            names = zf.namelist()
+            restored = []
+            if "users.json" in names:
+                users = json.loads(zf.read("users.json").decode())
+                if not isinstance(users, list):
+                    raise HTTPException(400, "users.json: expected array")
+                _write_users(users)
+                restored.append("users.json")
+            for entry in names:
+                parts = entry.split("/")
+                if len(parts) != 2: continue
+                driver_id, fname = parts
+                if fname not in file_map: continue
+                path, expect_list = file_map[fname]
+                parsed = json.loads(zf.read(entry).decode())
+                if expect_list and not isinstance(parsed, list):
+                    raise HTTPException(400, f"{entry}: expected array")
+                if not expect_list and not isinstance(parsed, dict):
+                    raise HTTPException(400, f"{entry}: expected object")
+                _write(path, parsed, driver_id)
+                restored.append(entry)
+    except zf_mod.BadZipFile:
+        raise HTTPException(400, "Invalid ZIP file")
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON in backup file")
+    return {"ok": True, "restored": restored}
+
 # ── pages ────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    profile = _read_profile()
-    if not profile: return RedirectResponse("/setup")
-    return _tmpl("index.html", request, {"profile": profile, "today": date.today().isoformat()})
+    ctx = _get_auth_ctx(request)
+    if not ctx: return RedirectResponse("/login", status_code=303)
+    if ctx.role == "admin" and not ctx.is_impersonating:
+        return RedirectResponse("/admin", status_code=303)
+    profile = _read_profile(ctx.effective_id)
+    if not profile: return RedirectResponse("/setup", status_code=303)
+    return _tmpl("index.html", request, {"profile": profile, "today": date.today().isoformat(),
+                                         **_ctx_tmpl(ctx)})
 
 @app.get("/setup", response_class=HTMLResponse)
 async def setup_page(request: Request):
-    return _tmpl("setup.html", request, {"profile": _read_profile()})
+    ctx = _get_auth_ctx(request)
+    if not ctx: return RedirectResponse("/login", status_code=303)
+    return _tmpl("setup.html", request, {"profile": _read_profile(ctx.effective_id), **_ctx_tmpl(ctx)})
 
 @app.post("/setup")
 async def save_profile(request: Request,
@@ -1496,6 +2770,10 @@ async def save_profile(request: Request,
                        pay_mode:     str = Form("standard"),
                        gate_fee:     str = Form(""),
                        company_pct:  str = Form("")):
+    ctx = _get_auth_ctx(request)
+    if not ctx: return RedirectResponse("/login", status_code=303)
+    if ctx.is_impersonating: return RedirectResponse("/", status_code=303)
+    driver_id = ctx.effective_id
     _write(PROFILE_F, {
         "driver_name": driver_name,
         "vehicle":     vehicle,
@@ -1503,19 +2781,38 @@ async def save_profile(request: Request,
         "pay_mode":    pay_mode,
         "gate_fee":    float(gate_fee)    if gate_fee    else None,
         "company_pct": float(company_pct) if company_pct else None,
-    })
+    }, driver_id)
     return RedirectResponse("/", status_code=303)
 
 # ── pickups ──────────────────────────────────────────────────────
 
+def _auth(request: Request) -> str:
+    ctx = _get_auth_ctx(request)
+    if not ctx: raise HTTPException(401, "Not authenticated")
+    return ctx.effective_id
+
+def _auth_write(request: Request) -> str:
+    ctx = _get_auth_ctx(request)
+    if not ctx: raise HTTPException(401, "Not authenticated")
+    if ctx.is_impersonating: raise HTTPException(403, "Read-only — viewing another driver's account.")
+    return ctx.effective_id
+
+def _require_admin(request: Request) -> AuthCtx:
+    ctx = _get_auth_ctx(request)
+    if not ctx: raise HTTPException(401, "Not authenticated")
+    if ctx.role != "admin": raise HTTPException(403, "Admin access required")
+    return ctx
+
 @app.get("/api/pickups")
-async def get_pickups(date: Optional[str] = None):
-    pickups = _read(PICKUPS_F)
+async def get_pickups(request: Request, date: Optional[str] = None):
+    did = _auth(request)
+    pickups = _read(PICKUPS_F, did)
     if date: pickups = [p for p in pickups if p.get("pickup_date") == date]
     return sorted(pickups, key=lambda p: p.get("pickup_time",""))
 
 @app.post("/api/pickups")
 async def create_pickup(request: Request):
+    did = _auth_write(request)
     body = await request.json()
     m, t = float(body.get("meter_total") or 0), float(body.get("tip") or 0)
     record = {
@@ -1532,19 +2829,21 @@ async def create_pickup(request: Request):
         "calculated_total": calc_total(m, t),
         "created_at": datetime.utcnow().isoformat(),
     }
-    pickups = _read(PICKUPS_F); pickups.append(record); _write(PICKUPS_F, pickups)
-    upsert_customer(record["customer_name"], record["street_address"], record["city"], record["phone_number"])
+    pickups = _read(PICKUPS_F, did); pickups.append(record); _write(PICKUPS_F, pickups, did)
+    upsert_customer(record["customer_name"], record["street_address"], record["city"], record["phone_number"], did)
     return record
 
 @app.get("/api/pickups/{pid}")
-async def get_pickup(pid: str):
-    rec = next((p for p in _read(PICKUPS_F) if p["id"] == pid), None)
+async def get_pickup(pid: str, request: Request):
+    did = _auth(request)
+    rec = next((p for p in _read(PICKUPS_F, did) if p["id"] == pid), None)
     if not rec: raise HTTPException(404, "Not found")
     return rec
 
 @app.put("/api/pickups/{pid}")
 async def update_pickup(pid: str, request: Request):
-    body = await request.json(); pickups = _read(PICKUPS_F)
+    did = _auth_write(request)
+    body = await request.json(); pickups = _read(PICKUPS_F, did)
     idx = next((i for i,p in enumerate(pickups) if p["id"] == pid), None)
     if idx is None: raise HTTPException(404, "Not found")
     rec = pickups[idx]
@@ -1554,30 +2853,34 @@ async def update_pickup(pid: str, request: Request):
     rec["meter_total"]       = float(rec.get("meter_total") or 0)
     rec["tip"]               = float(rec.get("tip") or 0)
     rec["calculated_total"]  = calc_total(rec["meter_total"], rec["tip"])
-    pickups[idx] = rec; _write(PICKUPS_F, pickups)
-    upsert_customer(rec["customer_name"], rec["street_address"], rec["city"], rec["phone_number"])
+    pickups[idx] = rec; _write(PICKUPS_F, pickups, did)
+    upsert_customer(rec["customer_name"], rec["street_address"], rec["city"], rec["phone_number"], did)
     return rec
 
 @app.delete("/api/pickups/{pid}")
-async def delete_pickup(pid: str):
-    pickups = _read(PICKUPS_F)
+async def delete_pickup(pid: str, request: Request):
+    did = _auth_write(request)
+    pickups = _read(PICKUPS_F, did)
     if not any(p["id"] == pid for p in pickups): raise HTTPException(404, "Not found")
-    _write(PICKUPS_F, [p for p in pickups if p["id"] != pid]); return {"ok": True}
+    _write(PICKUPS_F, [p for p in pickups if p["id"] != pid], did); return {"ok": True}
 
 @app.delete("/api/pickups")
-async def delete_all():
-    _write(PICKUPS_F, []); _write(CUSTOMERS_F, []); return {"ok": True}
+async def delete_all(request: Request):
+    did = _auth_write(request)
+    _write(PICKUPS_F, [], did); _write(CUSTOMERS_F, [], did); return {"ok": True}
 
 # ── expenses ─────────────────────────────────────────────────────
 
 @app.get("/api/expenses")
-async def get_expenses(date: Optional[str] = None):
-    expenses = _read(EXPENSES_F)
+async def get_expenses(request: Request, date: Optional[str] = None):
+    did = _auth(request)
+    expenses = _read(EXPENSES_F, did)
     if date: expenses = [e for e in expenses if e.get("date") == date]
     return sorted(expenses, key=lambda e: e.get("date",""))
 
 @app.post("/api/expenses")
 async def create_expense(request: Request):
+    did = _auth_write(request)
     body = await request.json()
     record = {
         "id": str(uuid.uuid4()),
@@ -1587,27 +2890,30 @@ async def create_expense(request: Request):
         "notes": body.get("notes",""),
         "created_at": datetime.utcnow().isoformat(),
     }
-    expenses = _read(EXPENSES_F); expenses.append(record); _write(EXPENSES_F, expenses)
+    expenses = _read(EXPENSES_F, did); expenses.append(record); _write(EXPENSES_F, expenses, did)
     return record
 
 @app.delete("/api/expenses/{eid}")
-async def delete_expense(eid: str):
-    expenses = _read(EXPENSES_F)
+async def delete_expense(eid: str, request: Request):
+    did = _auth_write(request)
+    expenses = _read(EXPENSES_F, did)
     if not any(e["id"] == eid for e in expenses): raise HTTPException(404, "Not found")
-    _write(EXPENSES_F, [e for e in expenses if e["id"] != eid]); return {"ok": True}
+    _write(EXPENSES_F, [e for e in expenses if e["id"] != eid], did); return {"ok": True}
 
 # ── shifts ───────────────────────────────────────────────────────
 
 @app.get("/api/shifts")
-async def get_shifts(date: Optional[str] = None):
-    shifts = _read(SHIFTS_F)
+async def get_shifts(request: Request, date: Optional[str] = None):
+    did = _auth(request)
+    shifts = _read(SHIFTS_F, did)
     if date: shifts = [s for s in shifts if s.get("date") == date]
     return shifts
 
 @app.post("/api/shifts")
 async def save_shift(request: Request):
+    did    = _auth_write(request)
     body   = await request.json()
-    shifts = _read(SHIFTS_F)
+    shifts = _read(SHIFTS_F, did)
     d      = body.get("date","")
     existing = next((s for s in shifts if s.get("date") == d), None)
     odo_start = float(body.get("odometer_start") or 0)
@@ -1622,7 +2928,7 @@ async def save_shift(request: Request):
             "miles":          miles,
             "notes":          body.get("notes",""),
         })
-        _write(SHIFTS_F, shifts)
+        _write(SHIFTS_F, shifts, did)
         return existing
     record = {
         "id": str(uuid.uuid4()), "date": d,
@@ -1632,34 +2938,37 @@ async def save_shift(request: Request):
         "notes":          body.get("notes",""),
         "created_at":     datetime.utcnow().isoformat(),
     }
-    shifts.append(record); _write(SHIFTS_F, shifts)
+    shifts.append(record); _write(SHIFTS_F, shifts, did)
     return record
 
 # ── daily totals (server-side, payment-mode aware) ───────────────
 
 @app.get("/api/daily-totals")
-async def daily_totals_api(date: Optional[str] = None):
-    profile  = _read_profile()
-    pickups  = _read(PICKUPS_F)
-    expenses = _read(EXPENSES_F)
+async def daily_totals_api(request: Request, date: Optional[str] = None):
+    did      = _auth(request)
+    profile  = _read_profile(did)
+    pickups  = _read(PICKUPS_F, did)
+    expenses = _read(EXPENSES_F, did)
     if date:
         pickups  = [p for p in pickups  if p.get("pickup_date") == date]
         expenses = [e for e in expenses if e.get("date")        == date]
     totals = day_totals(pickups, profile)
     exp_total = round(sum(e["amount"] for e in expenses), 2)
-    totals["expense_total"] = exp_total
-    totals["net_earnings"]  = round(totals["owed_driver"] - exp_total, 2)
-    totals["pay_mode"]      = profile.get("pay_mode", "standard")
+    totals["expense_total"]    = exp_total
+    totals["net_earnings"]     = round(totals["owed_driver"] - exp_total, 2)
+    totals["driver_earnings"]  = round(totals["owed_driver"] + totals["meter_cash"] + totals["tip_cash"] - exp_total, 2)
+    totals["pay_mode"]         = profile.get("pay_mode", "standard")
     return totals
 
 # ── report ───────────────────────────────────────────────────────
 
 @app.get("/api/report")
-async def report(from_date: str = "", to_date: str = ""):
-    profile      = _read_profile()
-    pickups      = _read(PICKUPS_F)
-    expenses_all = _read(EXPENSES_F)
-    shifts_all   = _read(SHIFTS_F)
+async def report(request: Request, from_date: str = "", to_date: str = ""):
+    did          = _auth(request)
+    profile      = _read_profile(did)
+    pickups      = _read(PICKUPS_F, did)
+    expenses_all = _read(EXPENSES_F, did)
+    shifts_all   = _read(SHIFTS_F, did)
 
     if from_date:
         pickups      = [p for p in pickups      if p.get("pickup_date","") >= from_date]
@@ -1681,23 +2990,29 @@ async def report(from_date: str = "", to_date: str = ""):
         day_e  = expense_map.get(d, [])
         totals = day_totals(day_p, profile)
         exp_total = round(sum(e["amount"] for e in day_e), 2)
-        totals["expense_total"] = exp_total
-        totals["net_earnings"]  = round(totals["owed_driver"] - exp_total, 2)
+        totals["expense_total"]   = exp_total
+        totals["net_earnings"]    = round(totals["owed_driver"] - exp_total, 2)
+        totals["driver_earnings"] = round(totals["owed_driver"] + totals["meter_cash"] + totals["tip_cash"] - exp_total, 2)
         days.append({"date": d, "pickups": day_p, "expenses": day_e,
                      "shift": shift_map.get(d), "totals": totals})
 
     summary = day_totals(pickups, profile)
+    # Gate mode: fee applies once per day with pickups, so sum per-day values
+    if profile.get("pay_mode", "standard") == "gate":
+        summary["owed_driver"] = round(sum(d["totals"]["owed_driver"] for d in days), 2)
     total_exp = round(sum(e["amount"] for e in expenses_all), 2)
-    summary["expense_total"] = total_exp
-    summary["net_earnings"]  = round(summary["owed_driver"] - total_exp, 2)
+    summary["expense_total"]   = total_exp
+    summary["net_earnings"]    = round(summary["owed_driver"] - total_exp, 2)
+    summary["driver_earnings"] = round(summary["owed_driver"] + summary["meter_cash"] + summary["tip_cash"] - total_exp, 2)
     summary["pay_mode"]      = profile.get("pay_mode", "standard")
     return {"days": days, "summary": summary}
 
 # ── CSV export ───────────────────────────────────────────────────
 
 @app.get("/api/report/csv")
-async def report_csv(from_date: str = "", to_date: str = ""):
-    pickups = _read(PICKUPS_F)
+async def report_csv(request: Request, from_date: str = "", to_date: str = ""):
+    did = _auth(request)
+    pickups = _read(PICKUPS_F, did)
     if from_date: pickups = [p for p in pickups if p.get("pickup_date","") >= from_date]
     if to_date:   pickups = [p for p in pickups if p.get("pickup_date","") <= to_date]
     buf = io.StringIO()
@@ -1719,21 +3034,22 @@ async def report_csv(from_date: str = "", to_date: str = ""):
 # ── PDF report ───────────────────────────────────────────────────
 
 @app.get("/api/report-pdf")
-async def report_pdf(from_date: str = "", to_date: str = ""):
+async def report_pdf(request: Request, from_date: str = "", to_date: str = ""):
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
     from reportlab.lib import colors
 
-    profile  = _read_profile()
+    did      = _auth(request)
+    profile  = _read_profile(did)
     driver   = profile.get("driver_name", "Unknown Driver")
     pay_mode = profile.get("pay_mode", "standard")
     mode_labels = {"standard":"Standard Split","gate":"Flat Gate Fee",
                    "commission":"Commission Split","owner":"Owner-Operator"}
 
-    pickups      = _read(PICKUPS_F)
-    expenses_all = _read(EXPENSES_F)
+    pickups      = _read(PICKUPS_F, did)
+    expenses_all = _read(EXPENSES_F, did)
     if from_date:
         pickups      = [p for p in pickups      if p.get("pickup_date","") >= from_date]
         expenses_all = [e for e in expenses_all if e.get("date","")        >= from_date]
@@ -1781,16 +3097,17 @@ async def report_pdf(from_date: str = "", to_date: str = ""):
         ("GRID", (0,0), (-1,-1), 0.4, colors.HexColor("#D1D5DB")),
     ]
 
-    grand_totals = {"meter":0,"tips":0,"gross":0,"expenses":0,"owed":0,"net":0,"count":0}
+    grand_totals = {"meter":0,"tip_cash":0,"tip_credit":0,"tip_voucher":0,"gross":0,"expenses":0,"owed":0,"net":0,"earnings":0,"count":0}
 
     for d in all_dates:
         day_p = sorted(pickup_map.get(d, []), key=lambda x: x.get("pickup_time",""))
         day_e = expense_map.get(d, [])
         totals= day_totals(day_p, profile)
         exp_total = round(sum(e["amount"] for e in day_e), 2)
-        net = round(totals["owed_driver"] - exp_total, 2)
+        net      = round(totals["owed_driver"] - exp_total, 2)
+        earnings = round(totals["owed_driver"] + totals["meter_cash"] + totals["tip_cash"] - exp_total, 2)
 
-        story.append(Paragraph(f"{d}  —  {totals['count']} pickups  |  Gross: ${totals['grand_total']:.2f}  |  Owed: ${totals['owed_driver']:.2f}  |  Net: ${net:.2f}", h2))
+        story.append(Paragraph(f"{d}  —  {totals['count']} pickups  |  Gross: ${totals['grand_total']:.2f}  |  Owed: ${totals['owed_driver']:.2f}  |  Earnings: ${earnings:.2f}", h2))
 
         rows = [["Time","From","To","Customer","Meter","Pay","Tip","Total"]]
         for p in day_p:
@@ -1825,24 +3142,29 @@ async def report_pdf(from_date: str = "", to_date: str = ""):
             story.append(et)
 
         story.append(Spacer(1, 6))
-        grand_totals["meter"]    += totals["meter_cash"]+totals["meter_credit"]+totals["meter_voucher"]
-        grand_totals["tips"]     += totals["tip_cash"]+totals["tip_credit"]+totals["tip_voucher"]
+        grand_totals["meter"]      += totals["meter_cash"]+totals["meter_credit"]+totals["meter_voucher"]
+        grand_totals["tip_cash"]   += totals["tip_cash"]
+        grand_totals["tip_credit"] += totals["tip_credit"]
+        grand_totals["tip_voucher"]+= totals["tip_voucher"]
         grand_totals["gross"]    += totals["grand_total"]
         grand_totals["expenses"] += exp_total
         grand_totals["owed"]     += totals["owed_driver"]
         grand_totals["net"]      += net
+        grand_totals["earnings"] += earnings
         grand_totals["count"]    += totals["count"]
 
     story.append(HRFlowable(width="100%", color=amber, thickness=2, spaceAfter=6))
     story.append(Paragraph("Summary", h2))
     sum_data = [
-        ["Total Pickups", str(grand_totals["count"])],
-        ["Total Meter",   f"${grand_totals['meter']:.2f}"],
-        ["Total Tips",    f"${grand_totals['tips']:.2f}"],
-        ["Gross Revenue", f"${grand_totals['gross']:.2f}"],
-        ["Total Expenses",f"${grand_totals['expenses']:.2f}"],
-        ["Total Owed Driver", f"${grand_totals['owed']:.2f}"],
-        ["Net Earnings",  f"${grand_totals['net']:.2f}"],
+        ["Total Pickups",    str(grand_totals["count"])],
+        ["Total Meter",      f"${grand_totals['meter']:.2f}"],
+        ["Cash Tips",        f"${grand_totals['tip_cash']:.2f}"],
+        ["Credit Tips",      f"${grand_totals['tip_credit']:.2f}"],
+        ["Voucher Tips",     f"${grand_totals['tip_voucher']:.2f}"],
+        ["Gross Revenue",    f"${grand_totals['gross']:.2f}"],
+        ["Total Expenses",   f"${grand_totals['expenses']:.2f}"],
+        ["Total Owed Driver",f"${grand_totals['owed']:.2f}"],
+        ["Earnings",         f"${grand_totals['earnings']:.2f}"],
     ]
     st = Table(sum_data, colWidths=[2*inch, 1.5*inch])
     st.setStyle(TableStyle([
@@ -1863,16 +3185,18 @@ async def report_pdf(from_date: str = "", to_date: str = ""):
 # ── customers ────────────────────────────────────────────────────
 
 @app.get("/api/customers/suggest")
-async def suggest(q: str = ""):
+async def suggest(request: Request, q: str = ""):
+    did = _auth(request)
     if not q or len(q) < 2: return []
-    q_low = q.lower(); customers = _read(CUSTOMERS_F)
+    q_low = q.lower(); customers = _read(CUSTOMERS_F, did)
     return [c for c in customers if q_low in c.get("name","").lower()
             or q_low in c.get("street_address","").lower()
             or q_low in c.get("phone","").lower()][:10]
 
 @app.get("/api/customers/lookup")
-async def lookup(phone: str = "", address: str = ""):
-    customers = _read(CUSTOMERS_F)
+async def lookup(request: Request, phone: str = "", address: str = ""):
+    did = _auth(request)
+    customers = _read(CUSTOMERS_F, did)
     if phone:
         c = next((x for x in customers if x.get("phone") == phone), None)
         if c: return c
@@ -1883,82 +3207,90 @@ async def lookup(phone: str = "", address: str = ""):
 
 # ── backup / restore ─────────────────────────────────────────────
 
+def _json_download(data, filename: str):
+    content = json.dumps(data, indent=2, default=str).encode()
+    return StreamingResponse(io.BytesIO(content), media_type="application/json",
+                             headers={"Content-Disposition": f"attachment; filename={filename}"})
+
 @app.get("/api/backup/pickups")
-async def backup_pickups():
-    if not PICKUPS_F.exists(): _write(PICKUPS_F, [])
-    return FileResponse(PICKUPS_F, filename=f"pickups_{date.today().isoformat()}.json", media_type="application/json")
+async def backup_pickups(request: Request):
+    did = _auth(request)
+    return _json_download(_read(PICKUPS_F, did), f"pickups_{date.today().isoformat()}.json")
 
 @app.get("/api/backup/customers")
-async def backup_customers():
-    if not CUSTOMERS_F.exists(): _write(CUSTOMERS_F, [])
-    return FileResponse(CUSTOMERS_F, filename=f"customers_{date.today().isoformat()}.json", media_type="application/json")
+async def backup_customers(request: Request):
+    did = _auth(request)
+    return _json_download(_read(CUSTOMERS_F, did), f"customers_{date.today().isoformat()}.json")
 
 @app.get("/api/backup/expenses")
-async def backup_expenses():
-    if not EXPENSES_F.exists(): _write(EXPENSES_F, [])
-    return FileResponse(EXPENSES_F, filename=f"expenses_{date.today().isoformat()}.json", media_type="application/json")
+async def backup_expenses(request: Request):
+    did = _auth(request)
+    return _json_download(_read(EXPENSES_F, did), f"expenses_{date.today().isoformat()}.json")
 
 @app.get("/api/backup/shifts")
-async def backup_shifts():
-    if not SHIFTS_F.exists(): _write(SHIFTS_F, [])
-    return FileResponse(SHIFTS_F, filename=f"shifts_{date.today().isoformat()}.json", media_type="application/json")
+async def backup_shifts(request: Request):
+    did = _auth(request)
+    return _json_download(_read(SHIFTS_F, did), f"shifts_{date.today().isoformat()}.json")
 
 @app.get("/api/backup/profile")
-async def backup_profile():
-    if not PROFILE_F.exists(): _write(PROFILE_F, {})
-    return FileResponse(PROFILE_F, filename=f"profile_{date.today().isoformat()}.json", media_type="application/json")
+async def backup_profile(request: Request):
+    did = _auth(request)
+    return _json_download(_read_profile(did), f"profile_{date.today().isoformat()}.json")
 
 @app.get("/api/backup/all")
-async def backup_all():
+async def backup_all(request: Request):
+    did = _auth(request)
     import zipfile as zf_mod
     files = [
-        (PICKUPS_F,   "pickups.json",   "[]"),
-        (CUSTOMERS_F, "customers.json", "[]"),
-        (EXPENSES_F,  "expenses.json",  "[]"),
-        (SHIFTS_F,    "shifts.json",    "[]"),
-        (PROFILE_F,   "profile.json",   "{}"),
+        (PICKUPS_F,   "pickups.json",   []),
+        (CUSTOMERS_F, "customers.json", []),
+        (EXPENSES_F,  "expenses.json",  []),
+        (SHIFTS_F,    "shifts.json",    []),
+        (PROFILE_F,   "profile.json",   {}),
     ]
     buf = io.BytesIO()
     with zf_mod.ZipFile(buf, 'w', zf_mod.ZIP_DEFLATED) as zf:
         for path, name, default in files:
-            if _GCS_BUCKET:
-                try:
-                    blob = _gcs_client().bucket(_GCS_BUCKET).blob(path.name)
-                    content = blob.download_as_text() if blob.exists() else default
-                except Exception:
-                    content = default
+            if path == PROFILE_F:
+                data = _read_profile(did) or default
             else:
-                content = path.read_text() if path.exists() else default
-            zf.writestr(name, content)
+                data = _read(path, did) or default
+            zf.writestr(name, json.dumps(data, indent=2, default=str))
     buf.seek(0)
     fname = f"taxilog_backup_{date.today().isoformat()}.zip"
     return StreamingResponse(buf, media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename={fname}"})
 
-async def _restore(file: UploadFile, path: Path, expect_list: bool):
+async def _restore(file: UploadFile, path: Path, expect_list: bool, driver_id: str):
     try: data = json.loads(await file.read())
     except Exception: raise HTTPException(400, "Invalid JSON file")
     if expect_list and not isinstance(data, list): raise HTTPException(400, "Expected a JSON array")
     if not expect_list and not isinstance(data, dict): raise HTTPException(400, "Expected a JSON object")
-    _write(path, data); return {"ok": True}
+    _write(path, data, driver_id); return {"ok": True}
 
 @app.post("/api/restore/pickups")
-async def restore_pickups(file: UploadFile = File(...)): return await _restore(file, PICKUPS_F, True)
+async def restore_pickups(request: Request, file: UploadFile = File(...)):
+    return await _restore(file, PICKUPS_F, True, _auth_write(request))
 
 @app.post("/api/restore/customers")
-async def restore_customers(file: UploadFile = File(...)): return await _restore(file, CUSTOMERS_F, True)
+async def restore_customers(request: Request, file: UploadFile = File(...)):
+    return await _restore(file, CUSTOMERS_F, True, _auth_write(request))
 
 @app.post("/api/restore/expenses")
-async def restore_expenses(file: UploadFile = File(...)): return await _restore(file, EXPENSES_F, True)
+async def restore_expenses(request: Request, file: UploadFile = File(...)):
+    return await _restore(file, EXPENSES_F, True, _auth_write(request))
 
 @app.post("/api/restore/shifts")
-async def restore_shifts(file: UploadFile = File(...)): return await _restore(file, SHIFTS_F, True)
+async def restore_shifts(request: Request, file: UploadFile = File(...)):
+    return await _restore(file, SHIFTS_F, True, _auth_write(request))
 
 @app.post("/api/restore/profile")
-async def restore_profile(file: UploadFile = File(...)): return await _restore(file, PROFILE_F, False)
+async def restore_profile(request: Request, file: UploadFile = File(...)):
+    return await _restore(file, PROFILE_F, False, _auth_write(request))
 
 @app.post("/api/restore/all")
-async def restore_all(file: UploadFile = File(...)):
+async def restore_all(request: Request, file: UploadFile = File(...)):
+    did = _auth_write(request)
     import zipfile as zf_mod
     try:
         data = await file.read()
@@ -1978,7 +3310,7 @@ async def restore_all(file: UploadFile = File(...)):
                         raise HTTPException(400, f"{name}: expected JSON array")
                     if not expect_list and not isinstance(parsed, dict):
                         raise HTTPException(400, f"{name}: expected JSON object")
-                    _write(path, parsed)
+                    _write(path, parsed, did)
                     restored.append(name)
     except zf_mod.BadZipFile:
         raise HTTPException(400, "Invalid ZIP file")
@@ -1989,13 +3321,14 @@ async def restore_all(file: UploadFile = File(...)):
 # ── requirements PDF (unchanged) ─────────────────────────────────
 
 @app.get("/api/requirements-pdf")
-async def requirements_pdf():
+async def requirements_pdf(request: Request):
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
     from reportlab.lib import colors
-    profile = _read_profile(); driver = profile.get("driver_name", "Unknown Driver")
+    did = _auth(request)
+    profile = _read_profile(did); driver = profile.get("driver_name", "Unknown Driver")
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=letter, leftMargin=inch, rightMargin=inch, topMargin=inch, bottomMargin=inch)
     styles = getSampleStyleSheet(); amber = colors.HexColor("#D97706"); dark = colors.HexColor("#1C1917")
@@ -2024,6 +3357,649 @@ async def requirements_pdf():
     doc.build(story); buf.seek(0)
     return StreamingResponse(buf, media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename=requirements_{date.today().isoformat()}.pdf"})
+
+# ── admin design document PDF ────────────────────────────────────
+
+@app.get("/api/admin/design-pdf")
+async def admin_design_pdf(request: Request):
+    _require_admin(request)
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, PageBreak
+    from reportlab.lib import colors
+
+    W = 6.5 * inch  # usable width
+
+    maize  = colors.HexColor("#FFCB05")
+    blue   = colors.HexColor("#00274C")
+    blue2  = colors.HexColor("#003366")
+    ltblue = colors.HexColor("#EEF1F6")
+    gray   = colors.HexColor("#6B6660")
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter,
+                            leftMargin=0.85*inch, rightMargin=0.85*inch,
+                            topMargin=0.85*inch, bottomMargin=0.85*inch)
+    styles = getSampleStyleSheet()
+
+    h1     = ParagraphStyle("h1",     parent=styles["Heading1"], textColor=blue,  fontSize=20, spaceAfter=2, leading=24)
+    h2     = ParagraphStyle("h2",     parent=styles["Heading2"], textColor=blue,  fontSize=13, spaceBefore=14, spaceAfter=5, leading=17)
+    h3     = ParagraphStyle("h3",     parent=styles["Heading3"], textColor=blue2, fontSize=10.5, spaceBefore=8, spaceAfter=3)
+    body   = ParagraphStyle("body",   parent=styles["BodyText"], fontSize=9,   leading=13, spaceAfter=3)
+    bullet = ParagraphStyle("bullet", parent=body, leftIndent=14, spaceAfter=2)
+    code   = ParagraphStyle("code",   parent=body, fontName="Courier", fontSize=8, leading=11, leftIndent=10, spaceAfter=2, backColor=ltblue)
+    small  = ParagraphStyle("small",  parent=body, fontSize=8, textColor=gray)
+    note   = ParagraphStyle("note",   parent=body, fontSize=8.5, textColor=blue2, leftIndent=8)
+
+    def T(col_widths, data, hbg=blue, alt=ltblue):
+        t = Table(data, colWidths=col_widths, repeatRows=1)
+        s = [
+            ("BACKGROUND",    (0,0),(-1,0), hbg),
+            ("TEXTCOLOR",     (0,0),(-1,0), colors.white),
+            ("FONTNAME",      (0,0),(-1,0), "Helvetica-Bold"),
+            ("FONTSIZE",      (0,0),(-1,-1), 8),
+            ("TOPPADDING",    (0,0),(-1,-1), 3),
+            ("BOTTOMPADDING", (0,0),(-1,-1), 3),
+            ("LEFTPADDING",   (0,0),(-1,-1), 5),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1), [colors.white, alt]),
+            ("GRID",          (0,0),(-1,-1), 0.3, colors.HexColor("#C5CDD8")),
+            ("FONTNAME",      (0,1),(-1,-1), "Helvetica"),
+            ("VALIGN",        (0,0),(-1,-1), "TOP"),
+        ]
+        t.setStyle(TableStyle(s))
+        return t
+
+    def hr(): return HRFlowable(width="100%", color=maize, thickness=2, spaceAfter=8, spaceBefore=4)
+    def sp(n=6): return Spacer(1, n)
+
+    gen = datetime.now().strftime("%B %d, %Y  %I:%M %p")
+
+    story = []
+
+    # ══════════════════════════════════════════════════════════════
+    # COVER
+    # ══════════════════════════════════════════════════════════════
+    story += [
+        sp(20),
+        Paragraph("Taxi Log", h1),
+        Paragraph("Application Design &amp; Specification Document", ParagraphStyle("sub", parent=h2, textColor=blue2, spaceBefore=0)),
+        hr(),
+        Paragraph(f"Version 3.0 — Generated {gen}", small),
+        sp(10),
+        Paragraph(
+            "This document provides complete specifications for the Taxi Log web application — "
+            "sufficient detail for an AI coding tool or developer to recreate the application from scratch. "
+            "It covers architecture, data models, authentication, business logic, every API endpoint, "
+            "UI structure, and deployment configuration.", body),
+        PageBreak(),
+    ]
+
+    # ══════════════════════════════════════════════════════════════
+    # 1. PURPOSE & SCOPE
+    # ══════════════════════════════════════════════════════════════
+    story += [
+        Paragraph("1. Purpose &amp; Scope", h2), hr(),
+        Paragraph("Taxi Log is a multi-driver web application that lets taxi drivers record every "
+                  "passenger pickup during their shift and produces end-of-day financial summaries, "
+                  "date-range earnings reports, and PDF/CSV exports. An admin role provides "
+                  "fleet-wide oversight with impersonation, reporting, and account management.", body),
+        sp(4),
+        Paragraph("Primary users:", h3),
+        Paragraph("• <b>Driver</b> — records pickups in real time, tracks expenses and shift hours, "
+                  "views own earnings, downloads reports.", bullet),
+        Paragraph("• <b>Admin</b> — manages all driver accounts, views fleet-wide totals, runs "
+                  "fleet reports, performs fleet backup and restore.", bullet),
+        sp(6),
+    ]
+
+    # ══════════════════════════════════════════════════════════════
+    # 2. TECHNICAL STACK
+    # ══════════════════════════════════════════════════════════════
+    story += [
+        Paragraph("2. Technical Stack", h2), hr(),
+        T([1.4*inch, 1.5*inch, 3.6*inch], [
+            ["Layer",           "Technology",             "Detail"],
+            ["Language",        "Python 3.11",            "Single-file app — entire backend in main.py"],
+            ["Web framework",   "FastAPI 0.104.1",        "Async; Jinja2 templating; form parsing via python-multipart"],
+            ["HTML templates",  "Jinja2 3.1.4",           "Server-side rendered; templates written to disk at startup"],
+            ["Frontend",        "Vanilla JS + HTML/CSS",  "No build step; all JS/CSS embedded in main.py as Python strings"],
+            ["Clock picker",    "Clocklet (CDN)",         "MIT, ~7 kB; analogue 12-hr clock for all time inputs"],
+            ["Storage",         "Google Cloud Storage",   "JSON files per driver namespace; local files when GCS_BUCKET unset"],
+            ["PDF generation",  "ReportLab 4.x",          "Server-side; used for earnings reports and this document"],
+            ["Auth library",    "itsdangerous",           "HMAC-SHA1 signed cookies (URLSafeTimedSerializer)"],
+            ["Password hash",   "bcrypt 5.x",             "Direct bcrypt — hashpw / checkpw (no passlib)"],
+            ["ASGI server",     "Uvicorn",                "With uvloop + httptools in production"],
+            ["Container",       "Docker (python:3.11-slim)", "Built by Cloud Build; run by Cloud Run"],
+        ]),
+        sp(8),
+    ]
+
+    # ══════════════════════════════════════════════════════════════
+    # 3. INFRASTRUCTURE & DEPLOYMENT
+    # ══════════════════════════════════════════════════════════════
+    story += [
+        Paragraph("3. Infrastructure &amp; Deployment", h2), hr(),
+        T([1.7*inch, 4.8*inch], [
+            ["Resource",              "Value"],
+            ["GCP Project ID",        "taxi-log-app-494917"],
+            ["Cloud Run service",     "taxilog  —  region: us-central1"],
+            ["Service URL",           "https://taxilog-841286102686.us-central1.run.app"],
+            ["Docker image registry", "us-central1-docker.pkg.dev/taxi-log-app-494917/taxilog/app"],
+            ["GCS data bucket",       "taxilog-data-genetownsend"],
+            ["Cloud Run memory",      "512 Mi"],
+            ["Scaling",               "Scales to zero when idle; one container handles all requests"],
+            ["Deploy script",         "./deploy.sh — runs: gcloud builds submit ... && gcloud run deploy ..."],
+        ]),
+        sp(8),
+        Paragraph("Environment variables (set via --set-env-vars in deploy.sh):", h3),
+        T([1.6*inch, 1.3*inch, 3.6*inch], [
+            ["Variable",      "Required", "Purpose"],
+            ["GCS_BUCKET",    "Yes",      "GCS bucket name. When absent, data is stored in local ./data/ files (dev mode)."],
+            ["SECRET_KEY",    "Yes",      "Signing key for itsdangerous. Must be a long random hex string."],
+            ["ADMIN_SECRET",  "Yes",      "Passphrase required on the admin registration form. Keep private."],
+            ["PORT",          "Auto",     "Set by Cloud Run. App reads os.environ.get('PORT', 8000) at startup."],
+        ]),
+        sp(6),
+        Paragraph("Dockerfile (production):", h3),
+        Paragraph("FROM python:3.11-slim", code),
+        Paragraph("WORKDIR /app", code),
+        Paragraph("COPY requirements.txt .", code),
+        Paragraph("RUN pip install --no-cache-dir -r requirements.txt", code),
+        Paragraph("COPY main.py .", code),
+        Paragraph("ENV PORT=8080", code),
+        Paragraph('CMD ["python3", "main.py"]', code),
+        sp(8),
+    ]
+
+    # ══════════════════════════════════════════════════════════════
+    # 4. APPLICATION STRUCTURE
+    # ══════════════════════════════════════════════════════════════
+    story += [
+        Paragraph("4. Application Structure", h2), hr(),
+        Paragraph("The entire application lives in a single file: <b>main.py</b>. At startup it writes "
+                  "HTML templates and static assets to disk from Python string constants, then starts "
+                  "serving. This eliminates the need for a separate static file deployment.", body),
+        sp(4),
+        T([1.8*inch, 4.7*inch], [
+            ["Section in main.py",       "Contents"],
+            ["Imports & path constants", "uuid, json, csv, io, os, datetime, Path, FastAPI, itsdangerous, bcrypt"],
+            ["HTML string constants",    "BASE_HTML, INDEX_HTML, SETUP_HTML, LOGIN_HTML, REGISTER_HTML, ADMIN_HTML, ADMIN_REGISTER_HTML"],
+            ["CSS string constant",      "CSS — all styles as one minified string"],
+            ["JS string constant",       "JS — all client-side logic as one string"],
+            ["Asset writer",             "Writes templates/ and static/ from the string constants above"],
+            ["Helpers",                  "_read, _write, _read_profile, _read_users, _write_users, session helpers, calc functions"],
+            ["FastAPI app & routes",     "All HTTP route handlers in order: auth, admin, pickups, expenses, shifts, reports, backup"],
+            ["Entry point",              "uvicorn.run() — reload=True locally, reload=False in production (GCS_BUCKET set)"],
+        ]),
+        sp(8),
+    ]
+
+    # ══════════════════════════════════════════════════════════════
+    # 5. AUTHENTICATION & SESSIONS
+    # ══════════════════════════════════════════════════════════════
+    story += [
+        Paragraph("5. Authentication &amp; Session Management", h2), hr(),
+
+        Paragraph("5.1  Cookies", h3),
+        T([1.4*inch, 1.1*inch, 1.1*inch, 3.4*inch], [
+            ["Cookie",     "Max-age",    "httponly", "Contents"],
+            ["txl_sess",   "30 days",    "Yes",      "itsdangerous-signed dict: {uid: <uuid>, role: 'driver'|'admin'}"],
+            ["txl_view",   "4 hours",   "Yes",      "itsdangerous-signed dict: {driver_id: <uuid>, driver_name: <str>} — admin impersonation only"],
+        ]),
+        sp(4),
+        Paragraph("Both cookies use samesite=lax. The secure flag is True when GCS_BUCKET is set (i.e. in production), "
+                  "False in local dev.", note),
+        sp(6),
+
+        Paragraph("5.2  AuthCtx dataclass", h3),
+        Paragraph("Every request parses cookies into an AuthCtx object:", body),
+        T([1.6*inch, 1.1*inch, 3.8*inch], [
+            ["Field",           "Type",   "Meaning"],
+            ["user_id",         "str",    "UUID of the logged-in user"],
+            ["role",            "str",    "'driver' or 'admin'"],
+            ["effective_id",    "str",    "UUID used to read/write data. Equals user_id normally; equals impersonated driver's ID when txl_view cookie is set."],
+            ["is_impersonating","bool",   "True when admin is viewing a driver. All write endpoints return HTTP 403 when this is True."],
+            ["viewed_name",     "str",    "Display name of the impersonated driver (from txl_view cookie)."],
+        ]),
+        sp(6),
+
+        Paragraph("5.3  Auth helper functions", h3),
+        T([1.5*inch, 5.0*inch], [
+            ["Helper",          "Behaviour"],
+            ["_auth(request)",       "Returns effective_id. Raises HTTP 401 if no valid session."],
+            ["_auth_write(request)", "Returns effective_id. Raises HTTP 401 if no session; HTTP 403 if is_impersonating."],
+            ["_require_admin(request)", "Returns AuthCtx. Raises HTTP 401 if no session; HTTP 403 if role != 'admin'."],
+        ]),
+        sp(6),
+
+        Paragraph("5.4  Registration rules", h3),
+        Paragraph("• Username: case-insensitive unique across all users. No minimum length.", bullet),
+        Paragraph("• Password: minimum 6 characters. Stored as bcrypt hash (gensalt default cost).", bullet),
+        Paragraph("• Driver registration (/register): open to anyone. First user to register triggers "
+                  "a one-time data migration (flat files → driver namespace).", bullet),
+        Paragraph("• Admin registration (/admin/register): form accepts an admin_secret field that must "
+                  "exactly match the ADMIN_SECRET env var. The GET endpoint returns HTTP 404 if "
+                  "ADMIN_SECRET is not configured.", bullet),
+        sp(6),
+
+        Paragraph("5.5  Login flow", h3),
+        Paragraph("POST /login → look up username (case-insensitive) → verify bcrypt hash → check active=True "
+                  "→ set txl_sess cookie → redirect to /admin (admin) or / (driver).", body),
+        sp(8),
+    ]
+
+    # ══════════════════════════════════════════════════════════════
+    # 6. DATA MODELS
+    # ══════════════════════════════════════════════════════════════
+    story += [
+        Paragraph("6. Data Models", h2), hr(),
+        Paragraph("All files are JSON arrays (or a single object for profile.json). "
+                  "All IDs are UUID4 strings. Dates are YYYY-MM-DD strings. "
+                  "Timestamps (created_at) are UTC ISO-8601 strings.", body),
+        sp(4),
+
+        Paragraph("6.1  users.json  (global, not namespaced)", h3),
+        T([1.5*inch, 0.8*inch, 0.7*inch, 3.5*inch], [
+            ["Field",           "Type",   "Req",  "Description"],
+            ["id",              "string", "Yes",  "UUID4 — primary key; used as GCS namespace prefix"],
+            ["username",        "string", "Yes",  "Login name; stored as entered, compared case-insensitively"],
+            ["password_hash",   "string", "Yes",  "bcrypt hash of the password"],
+            ["role",            "string", "Yes",  "'driver' or 'admin'"],
+            ["active",          "bool",   "Yes",  "False = account deactivated; login rejected"],
+            ["created_at",      "string", "Yes",  "UTC ISO-8601 datetime of registration"],
+        ]),
+        sp(6),
+
+        Paragraph("6.2  pickups.json  (array, per driver)", h3),
+        T([1.7*inch, 0.8*inch, 0.7*inch, 3.3*inch], [
+            ["Field",               "Type",   "Req",  "Description"],
+            ["id",                  "string", "Yes",  "UUID4"],
+            ["pickup_date",         "string", "Yes",  "YYYY-MM-DD"],
+            ["pickup_time",         "string", "Yes",  "HH:MM (12- or 24-hr, as entered)"],
+            ["street_address",      "string", "No",   "Pickup street address"],
+            ["city",                "string", "No",   "Pickup city"],
+            ["customer_name",       "string", "No",   "Customer full name"],
+            ["phone_number",        "string", "No",   "Customer phone"],
+            ["destination_address", "string", "No",   "Drop-off address"],
+            ["meter_total",         "float",  "Yes",  "Fare shown on meter"],
+            ["payment_method",      "string", "Yes",  "'cash', 'credit', or 'voucher'"],
+            ["tip",                 "float",  "No",   "Tip amount (0 if none)"],
+            ["tip_payment_method",  "string", "No",   "'cash', 'credit', or 'voucher'"],
+            ["calculated_total",    "float",  "Yes",  "meter_total + tip  (server-computed)"],
+            ["created_at",          "string", "Yes",  "UTC ISO-8601 datetime"],
+        ]),
+        sp(6),
+
+        Paragraph("6.3  customers.json  (array, per driver)", h3),
+        T([1.6*inch, 0.8*inch, 0.7*inch, 3.4*inch], [
+            ["Field",          "Type",   "Req", "Description"],
+            ["id",             "string", "Yes", "UUID4"],
+            ["name",           "string", "Yes", "Customer full name (used as lookup key when no phone)"],
+            ["street_address", "string", "No",  "Most recent pickup address for this customer"],
+            ["city",           "string", "No",  "City"],
+            ["phone",          "string", "No",  "Phone number (primary lookup key)"],
+        ]),
+        Paragraph("Upsert logic: when a pickup is saved, the customer record is created or updated. "
+                  "Match priority: (1) phone number exact match; (2) name case-insensitive match. "
+                  "Non-empty incoming fields overwrite stored fields.", note),
+        sp(6),
+
+        Paragraph("6.4  expenses.json  (array, per driver)", h3),
+        T([1.5*inch, 0.8*inch, 0.7*inch, 3.5*inch], [
+            ["Field",      "Type",   "Req", "Description"],
+            ["id",         "string", "Yes", "UUID4"],
+            ["date",       "string", "Yes", "YYYY-MM-DD"],
+            ["category",   "string", "Yes", "Free-text category (e.g. 'Fuel', 'Tolls')"],
+            ["amount",     "float",  "Yes", "Expense amount in dollars"],
+            ["notes",      "string", "No",  "Optional notes"],
+            ["created_at", "string", "Yes", "UTC ISO-8601 datetime"],
+        ]),
+        sp(6),
+
+        Paragraph("6.5  shifts.json  (array, per driver — one record per date)", h3),
+        T([1.6*inch, 0.8*inch, 0.7*inch, 3.4*inch], [
+            ["Field",           "Type",   "Req", "Description"],
+            ["id",              "string", "Yes", "UUID4"],
+            ["date",            "string", "Yes", "YYYY-MM-DD — unique per driver; POST is an upsert by date"],
+            ["start_time",      "string", "No",  "Shift start time (HH:MM)"],
+            ["end_time",        "string", "No",  "Shift end time (HH:MM)"],
+            ["odometer_start",  "float",  "No",  "Odometer reading at shift start"],
+            ["odometer_end",    "float",  "No",  "Odometer reading at shift end"],
+            ["miles",           "float",  "Yes", "max(odometer_end − odometer_start, 0)  — server-computed"],
+            ["notes",           "string", "No",  "Free-text shift notes"],
+            ["created_at",      "string", "Yes", "UTC ISO-8601 datetime (first save only; not updated on upsert)"],
+        ]),
+        sp(6),
+
+        Paragraph("6.6  profile.json  (single object, per driver)", h3),
+        T([1.6*inch, 0.8*inch, 0.7*inch, 3.4*inch], [
+            ["Field",        "Type",         "Req", "Description"],
+            ["driver_name",  "string",        "Yes", "Display name shown in app and reports"],
+            ["vehicle",      "string",        "No",  "Vehicle description (free text)"],
+            ["phone",        "string",        "No",  "Driver's own phone number"],
+            ["pay_mode",     "string",        "Yes", "'standard', 'gate', 'commission', or 'owner'"],
+            ["gate_fee",     "float or null", "No",  "Daily gate fee — used when pay_mode='gate'"],
+            ["company_pct",  "float or null", "No",  "Company percentage (0–100) — used when pay_mode='commission'"],
+        ]),
+        sp(8),
+    ]
+
+    # ══════════════════════════════════════════════════════════════
+    # 7. BUSINESS LOGIC
+    # ══════════════════════════════════════════════════════════════
+    story += [
+        Paragraph("7. Business Logic — Financial Calculations", h2), hr(),
+
+        Paragraph("7.1  Day totals (day_totals function)", h3),
+        Paragraph("Iterates all pickups for a date, accumulates meter and tip amounts into six buckets "
+                  "by payment method, sums calculated_total into grand_total, then calls owed_driver_amount.", body),
+        Paragraph("meter_cash    += meter_total  where payment_method == 'cash'", code),
+        Paragraph("meter_credit  += meter_total  where payment_method == 'credit'", code),
+        Paragraph("meter_voucher += meter_total  where payment_method == 'voucher'", code),
+        Paragraph("tip_cash      += tip  where tip_payment_method == 'cash'", code),
+        Paragraph("tip_credit    += tip  where tip_payment_method == 'credit'", code),
+        Paragraph("tip_voucher   += tip  where tip_payment_method == 'voucher'", code),
+        Paragraph("grand_total   += calculated_total  (for every pickup)", code),
+        sp(6),
+
+        Paragraph("7.2  Owed Driver calculation (owed_driver_amount function)", h3),
+        T([1.4*inch, 2.5*inch, 2.6*inch], [
+            ["pay_mode",    "Formula",                                          "Variables"],
+            ["standard",    "((mcr + mv) - mc) / 2 + tcr + tv",               "mc=meter_cash, mcr=meter_credit, mv=meter_voucher, tcr=tip_credit, tv=tip_voucher"],
+            ["gate",        "grand_total - gate_fee",                          "gate_fee from profile.json"],
+            ["commission",  "(mc+mcr+mv) * (1 - company_pct/100) + (tc+tcr+tv)", "company_pct from profile.json; tc=tip_cash"],
+            ["owner",       "grand_total",                                     "Driver keeps everything"],
+        ]),
+        sp(6),
+
+        Paragraph("7.3  Earnings (driver take-home after expenses)", h3),
+        Paragraph("earnings = owed_driver + meter_cash + tip_cash - expense_total", code),
+        Paragraph("Rationale: in standard mode owed_driver already excludes cash meter and cash tips "
+                  "(which the driver physically collected). Adding them back gives true take-home "
+                  "before deducting expenses.", note),
+        sp(6),
+
+        Paragraph("7.4  Pickup calculated_total", h3),
+        Paragraph("calculated_total = round(meter_total + tip, 2)  — server-computed on every create/update.", code),
+        sp(8),
+    ]
+
+    # ══════════════════════════════════════════════════════════════
+    # 8. API REFERENCE
+    # ══════════════════════════════════════════════════════════════
+    story += [
+        Paragraph("8. API Reference", h2), hr(),
+        Paragraph("Auth column: P=Public, D=Driver (any logged-in user), W=Write (driver, not impersonating), A=Admin only.", small),
+        sp(4),
+
+        Paragraph("8.1  Authentication &amp; Account Routes", h3),
+        T([0.9*inch, 2.0*inch, 0.45*inch, 3.15*inch], [
+            ["Method", "Path",              "Auth", "Behaviour"],
+            ["GET",  "/login",              "P",    "Render login form"],
+            ["POST", "/login",              "P",    "Form: username, password. Validates, sets txl_sess, redirects to / or /admin"],
+            ["GET",  "/register",           "P",    "Render driver registration form"],
+            ["POST", "/register",           "P",    "Form: username, password, confirm. Creates driver account; redirects to /setup (first user) or /"],
+            ["POST", "/logout",             "D",    "Clears txl_sess and txl_view cookies; redirects to /login"],
+            ["GET",  "/admin/register",     "P",    "Render admin registration form. Returns 404 if ADMIN_SECRET not configured."],
+            ["POST", "/admin/register",     "P",    "Form: username, password, confirm, admin_secret. Creates admin account."],
+            ["POST", "/api/change-password","D",    "JSON: {current_password, new_password}. Min 6 chars. Returns {ok:true}."],
+        ]),
+        sp(6),
+
+        Paragraph("8.2  Page Routes", h3),
+        T([0.9*inch, 2.0*inch, 0.45*inch, 3.15*inch], [
+            ["Method", "Path",                "Auth", "Behaviour"],
+            ["GET",  "/",                     "D",    "Main log page. Query param: date (YYYY-MM-DD, default today)."],
+            ["GET",  "/setup",                "D",    "Profile / expenses / shifts / backup page."],
+            ["POST", "/setup",                "W",    "Form: driver_name, vehicle, phone, pay_mode, gate_fee, company_pct. Saves profile.json."],
+            ["GET",  "/admin",                "A",    "Admin dashboard with today's fleet totals and driver list."],
+            ["GET",  "/admin/view/{id}",      "A",    "Sets txl_view cookie for driver {id}; redirects to /."],
+            ["POST", "/admin/exit-view",      "A",    "Clears txl_view cookie; redirects to /admin."],
+            ["POST", "/admin/deactivate/{id}","A",    "Sets active=False on driver account."],
+            ["POST", "/admin/reactivate/{id}","A",    "Sets active=True on driver account."],
+            ["POST", "/admin/delete/{id}",    "A",    "Removes driver from users.json and deletes all GCS files under {id}/."],
+        ]),
+        sp(6),
+
+        Paragraph("8.3  Pickup API", h3),
+        T([0.9*inch, 2.3*inch, 0.45*inch, 2.85*inch], [
+            ["Method",   "Path",             "Auth", "Behaviour"],
+            ["GET",    "/api/pickups",        "D",    "Query param: date (optional). Returns array sorted by pickup_time."],
+            ["POST",   "/api/pickups",        "W",    "JSON body: pickup fields. Server computes calculated_total. Upserts customer. Returns created record."],
+            ["GET",    "/api/pickups/{pid}",  "D",    "Returns single pickup by id. 404 if not found."],
+            ["PUT",    "/api/pickups/{pid}",  "W",    "JSON body: partial or full pickup fields. Recomputes calculated_total. Upserts customer."],
+            ["DELETE", "/api/pickups/{pid}",  "W",    "Deletes single pickup. 404 if not found."],
+            ["DELETE", "/api/pickups",        "W",    "Deletes ALL pickups and ALL customers for this driver."],
+        ]),
+        sp(6),
+
+        Paragraph("8.4  Expense API", h3),
+        T([0.9*inch, 2.3*inch, 0.45*inch, 2.85*inch], [
+            ["Method",   "Path",               "Auth", "Behaviour"],
+            ["GET",    "/api/expenses",         "D",    "Query param: date (optional). Returns array sorted by date."],
+            ["POST",   "/api/expenses",         "W",    "JSON: {date, category, amount, notes}. Returns created record."],
+            ["DELETE", "/api/expenses/{eid}",   "W",    "Deletes expense by id. 404 if not found."],
+        ]),
+        sp(6),
+
+        Paragraph("8.5  Shift API", h3),
+        T([0.9*inch, 2.3*inch, 0.45*inch, 2.85*inch], [
+            ["Method", "Path",          "Auth", "Behaviour"],
+            ["GET",  "/api/shifts",     "D",    "Query param: date (optional). Returns array."],
+            ["POST", "/api/shifts",     "W",    "JSON: {date, start_time, end_time, odometer_start, odometer_end, notes}. Upsert by date: updates existing record if date already exists. Miles = max(odo_end - odo_start, 0)."],
+        ]),
+        sp(6),
+
+        Paragraph("8.6  Totals &amp; Reports API", h3),
+        T([0.9*inch, 2.6*inch, 0.45*inch, 2.55*inch], [
+            ["Method", "Path",                  "Auth", "Behaviour"],
+            ["GET", "/api/daily-totals",         "D",    "Query param: date. Returns day_totals object plus expense_total, net_earnings, driver_earnings, pay_mode."],
+            ["GET", "/api/report",               "D",    "Query params: from_date, to_date. Returns {days: [...], summary: {...}} with per-day pickup arrays, totals, shift data, and aggregate summary."],
+            ["GET", "/api/report/csv",           "D",    "Same params as /api/report. Returns CSV download of all pickups (no summary)."],
+            ["GET", "/api/report-pdf",           "D",    "Same params. Returns PDF with per-day tables and grand-total summary."],
+            ["GET", "/api/customers/suggest",    "D",    "Query param: q (min 2 chars). Returns up to 10 customer records matching name, address, or phone."],
+            ["GET", "/api/customers/lookup",     "D",    "Query params: phone, address. Exact match — phone takes priority. Returns single customer or {}."],
+        ]),
+        sp(6),
+
+        Paragraph("8.7  Driver Backup &amp; Restore API", h3),
+        T([0.9*inch, 2.4*inch, 0.45*inch, 2.75*inch], [
+            ["Method", "Path",                   "Auth", "Behaviour"],
+            ["GET",  "/api/backup/pickups",       "D",    "Downloads pickups.json as attachment."],
+            ["GET",  "/api/backup/customers",     "D",    "Downloads customers.json."],
+            ["GET",  "/api/backup/expenses",      "D",    "Downloads expenses.json."],
+            ["GET",  "/api/backup/shifts",        "D",    "Downloads shifts.json."],
+            ["GET",  "/api/backup/profile",       "D",    "Downloads profile.json."],
+            ["GET",  "/api/backup/all",           "D",    "Downloads ZIP containing all 5 files above. Filename: taxilog_backup_YYYY-MM-DD.zip."],
+            ["POST", "/api/restore/pickups",      "W",    "Multipart file upload. Expects JSON array. Overwrites pickups.json."],
+            ["POST", "/api/restore/customers",    "W",    "Expects JSON array. Overwrites customers.json."],
+            ["POST", "/api/restore/expenses",     "W",    "Expects JSON array. Overwrites expenses.json."],
+            ["POST", "/api/restore/shifts",       "W",    "Expects JSON array. Overwrites shifts.json."],
+            ["POST", "/api/restore/profile",      "W",    "Expects JSON object. Overwrites profile.json."],
+            ["POST", "/api/restore/all",          "W",    "Multipart ZIP upload. Restores any of the 5 files found inside the ZIP. Returns {ok:true, restored:[...]}."],
+        ]),
+        sp(6),
+
+        Paragraph("8.8  Admin API", h3),
+        T([0.9*inch, 2.6*inch, 0.45*inch, 2.55*inch], [
+            ["Method", "Path",                       "Auth", "Behaviour"],
+            ["GET",  "/api/admin/fleet-report",       "A",    "Query params: from_date, to_date. Returns {drivers:[...], summary:{...}} — per-driver totals aggregated over date range."],
+            ["GET",  "/api/admin/fleet-report-pdf",   "A",    "Same params. Returns fleet PDF report."],
+            ["POST", "/api/admin/delete-all",         "A",    "Deletes all driver accounts and all their GCS data. Admin accounts preserved."],
+            ["GET",  "/api/admin/backup/all",         "A",    "Downloads fleet ZIP: users.json + every driver's 5 data files under {id}/ folders."],
+            ["POST", "/api/admin/restore/all",        "A",    "Multipart ZIP upload. Restores users.json and all driver data files from fleet backup ZIP."],
+            ["GET",  "/api/admin/design-pdf",         "A",    "Downloads this design document."],
+            ["GET",  "/api/requirements-pdf",         "D",    "Legacy: simplified requirements PDF (driver-accessible)."],
+        ]),
+        sp(8),
+    ]
+
+    # ══════════════════════════════════════════════════════════════
+    # 9. UI ARCHITECTURE
+    # ══════════════════════════════════════════════════════════════
+    story += [
+        Paragraph("9. UI Architecture", h2), hr(),
+        Paragraph("The UI is server-rendered HTML with JavaScript making AJAX calls to the JSON API. "
+                  "There is no SPA router — each major section is a full-page load. Modals and dynamic "
+                  "panels are plain HTML/CSS controlled by JS.", body),
+        sp(4),
+
+        Paragraph("9.1  Page: /  (Main Log)", h3),
+        T([1.8*inch, 4.7*inch], [
+            ["Component",           "Description"],
+            ["Date picker",         "Defaults to today. Changing date reloads pickups and totals for that date."],
+            ["Pickup form",         "Fields: pickup_time (clock picker), street_address, city, customer_name (autocomplete), phone_number, destination_address, meter_total, payment_method, tip, tip_payment_method. Submits to POST /api/pickups."],
+            ["Pickup list",         "Cards rendered from GET /api/pickups?date=. Each card has Edit and Delete buttons."],
+            ["Edit inline",         "Clicking Edit replaces card footer with editable fields; Save calls PUT /api/pickups/{id}."],
+            ["Daily totals panel",  "Fetched from GET /api/daily-totals?date=. Shows meter by type, tips by type, owed driver (large), earnings. Refreshed after every pickup create/update/delete."],
+            ["Customer autocomplete","Typeahead on customer_name: calls GET /api/customers/suggest?q=. On select, fills address and phone. On phone blur, calls GET /api/customers/lookup?phone= to auto-fill name and address."],
+            ["Clock picker",        "Clocklet library (CDN). Attached to pickup_time input. 12-hour face with AM/PM toggle."],
+        ]),
+        sp(6),
+
+        Paragraph("9.2  Page: /setup  (Driver Setup)", h3),
+        T([1.8*inch, 4.7*inch], [
+            ["Panel",           "Description"],
+            ["Profile",         "Form: driver_name, vehicle, phone, pay_mode (select), gate_fee or company_pct (shown conditionally based on pay_mode). POST /setup."],
+            ["Password change",  "Inline form: current_password, new_password. AJAX to POST /api/change-password."],
+            ["Expenses",        "Add expense form (date, category, amount, notes). Lists today's expenses. Delete button per item."],
+            ["Shift log",       "Fields: start_time, end_time (clock pickers), odometer_start, odometer_end, notes. Save calls POST /api/shifts (upsert by date)."],
+            ["Earnings report", "Date range pickers. Generate button fetches GET /api/report and renders HTML table in a modal. Per-day accordion with pickup rows (horizontally scrollable). Summary grid at bottom. CSV and PDF export buttons."],
+            ["Backup",          "Download buttons for each file and a ZIP of all. Uses plain <a download> tags — no JS fetch."],
+            ["Restore",         "Visible file inputs per data type + restore button per type. Full restore accepts ZIP."],
+        ]),
+        sp(6),
+
+        Paragraph("9.3  Page: /admin  (Admin Dashboard)", h3),
+        T([1.8*inch, 4.7*inch], [
+            ["Section",         "Description"],
+            ["Fleet Overview",  "Stats cards: total drivers, today's fleet gross, today's fleet earnings."],
+            ["Today's Totals",  "Table: one row per active driver showing pickups, meter, tips, expenses, owed, earnings. Footer row with fleet total."],
+            ["Fleet Report",    "Date range pickers + Generate button. AJAX to /api/admin/fleet-report. Renders table in page. PDF button."],
+            ["Fleet Backup",    "Single <a download> link to /api/admin/backup/all."],
+            ["Fleet Restore",   "Visible file input + Restore button. Reads input.files[0] directly."],
+            ["Design Document", "Single <a download> link to /api/admin/design-pdf."],
+            ["Danger Zone",     "Delete database button → inline confirmation panel where admin must type 'DELETE' before confirming."],
+            ["Active Drivers",  "Table with View (impersonate), Deactivate, Delete buttons per driver."],
+            ["Administrators",  "List of admin accounts. Cannot delete own account."],
+            ["Deactivated",     "List of deactivated accounts with Reactivate and Delete Forever buttons."],
+        ]),
+        sp(8),
+    ]
+
+    # ══════════════════════════════════════════════════════════════
+    # 10. NAVIGATION & THEMING
+    # ══════════════════════════════════════════════════════════════
+    story += [
+        Paragraph("10. Navigation &amp; Visual Theme", h2), hr(),
+
+        Paragraph("10.1  Navigation", h3),
+        Paragraph("Hamburger menu (top-right) opens a vertical nav drawer. Links shown depend on role: "
+                  "drivers see Log and Setup; admins see Admin Dashboard, Log, and Setup. "
+                  "Sign Out is always present.", body),
+        Paragraph("Impersonation banner: when admin is viewing a driver, a sticky banner at the top shows "
+                  "'Viewing [Name] — Read Only' with an Exit View button.", body),
+        sp(6),
+
+        Paragraph("10.2  Color theme (Michigan Maize &amp; Blue)", h3),
+        T([1.8*inch, 1.5*inch, 3.2*inch], [
+            ["CSS variable",    "Value",        "Used for"],
+            ["--amber",         "#FFCB05",      "Michigan Maize — primary accent, active nav, focus rings"],
+            ["--amber-d",       "#E5B700",      "Hover state for Maize elements"],
+            ["--amber-dd",      "#A38400",      "Maize text on light backgrounds"],
+            ["--amber-lt",      "#FFF8CC",      "Light Maize fill (table alternating rows)"],
+            ["--amber-xl",      "#FFFDE5",      "Extra-light Maize wash"],
+            ["--bg",            "#F5F7FA",      "Page background (cool off-white)"],
+            ["--surface",       "#FFFFFF",      "Card/panel background"],
+            ["--surface2",      "#EEF1F6",      "Secondary surface, table header backgrounds"],
+            ["--text",          "#0A1628",      "Body text (deep navy)"],
+            ["Header / nav",    "#00274C",      "Michigan Blue — site header, nav drawer, secondary buttons"],
+            ["Btn primary",     "#FFCB05 bg, #00274C text", "Maize button with Blue text (WCAG AA)"],
+            ["Btn secondary",   "#00274C bg, white text",   "Michigan Blue button"],
+            ["--red",           "#EF4444",      "Danger actions, expense amounts"],
+            ["--green",         "#10B981",      "Earnings, positive values"],
+        ]),
+        sp(8),
+    ]
+
+    # ══════════════════════════════════════════════════════════════
+    # 11. BACKUP & RESTORE
+    # ══════════════════════════════════════════════════════════════
+    story += [
+        Paragraph("11. Backup &amp; Restore System", h2), hr(),
+
+        Paragraph("11.1  Driver backup ZIP structure", h3),
+        Paragraph("taxilog_backup_YYYY-MM-DD.zip", code),
+        Paragraph("  pickups.json      — JSON array", code),
+        Paragraph("  customers.json    — JSON array", code),
+        Paragraph("  expenses.json     — JSON array", code),
+        Paragraph("  shifts.json       — JSON array", code),
+        Paragraph("  profile.json      — JSON object", code),
+        sp(6),
+
+        Paragraph("11.2  Fleet backup ZIP structure", h3),
+        Paragraph("taxilog_fleet_backup_YYYY-MM-DD.zip", code),
+        Paragraph("  users.json                  — JSON array of all user accounts", code),
+        Paragraph("  {driver_id}/pickups.json    — one folder per driver", code),
+        Paragraph("  {driver_id}/customers.json", code),
+        Paragraph("  {driver_id}/expenses.json", code),
+        Paragraph("  {driver_id}/shifts.json", code),
+        Paragraph("  {driver_id}/profile.json", code),
+        sp(6),
+
+        Paragraph("11.3  Restore validation", h3),
+        Paragraph("• Array files (pickups, customers, expenses, shifts): server rejects if JSON root is not a list.", bullet),
+        Paragraph("• Object files (profile): server rejects if JSON root is not a dict.", bullet),
+        Paragraph("• ZIP restore: processes only files that are present in the ZIP; missing files are skipped.", bullet),
+        Paragraph("• All restore endpoints require W auth (driver, not impersonating).", bullet),
+        Paragraph("• Fleet restore requires A auth.", bullet),
+        sp(8),
+    ]
+
+    # ══════════════════════════════════════════════════════════════
+    # 12. VALIDATION & CONSTRAINTS
+    # ══════════════════════════════════════════════════════════════
+    story += [
+        Paragraph("12. Validation &amp; Constraints", h2), hr(),
+        T([2.0*inch, 4.5*inch], [
+            ["Rule",                        "Detail"],
+            ["Password minimum",            "6 characters. Checked on registration and change-password."],
+            ["Username uniqueness",         "Case-insensitive. Checked at registration time only (no rename)."],
+            ["Impersonation write block",   "Any POST/PUT/DELETE data endpoint returns HTTP 403 if is_impersonating=True."],
+            ["Admin self-delete",           "Admin cannot delete their own account; button hidden in UI, guard in route."],
+            ["Session expiry",              "txl_sess: 30 days. txl_view: 4 hours. Expired tokens are rejected silently."],
+            ["Shift uniqueness",            "One shift record per driver per date. POST /api/shifts is an upsert."],
+            ["Odometer miles",              "Computed as max(odometer_end - odometer_start, 0) — never negative."],
+            ["Meter / tip defaults",        "If missing or empty, server coerces to 0.0 before storage."],
+            ["Delete all pickups",          "Also deletes all customers (DELETE /api/pickups with no path param)."],
+            ["Delete database",             "UI requires admin to type 'DELETE' exactly before the form submits."],
+            ["ADMIN_SECRET absent",         "GET /admin/register returns HTTP 404; POST returns HTTP 404."],
+            ["Inactive account login",      "Login rejected with 'This account has been deactivated.' message."],
+        ]),
+        sp(8),
+    ]
+
+    # ══════════════════════════════════════════════════════════════
+    # 13. DATA MIGRATION
+    # ══════════════════════════════════════════════════════════════
+    story += [
+        Paragraph("13. Data Migration (first-user)", h2), hr(),
+        Paragraph("Before the multi-driver system was introduced, all data was stored as flat GCS blobs "
+                  "(pickups.json, customers.json, etc.) with no driver namespace prefix. When the first "
+                  "driver account is registered, _migrate_flat_data() is called:", body),
+        Paragraph("• In GCS: copies each flat blob to {driver_id}/{name}; deletes the old flat blob.", bullet),
+        Paragraph("• Locally: renames ./data/{name} to ./data/{driver_id}/{name}.", bullet),
+        Paragraph("• Only runs once (is_first = len(users) == 0 before appending the new user).", bullet),
+        Paragraph("• Migration is idempotent: destination blob/file existence is checked before writing.", bullet),
+        sp(8),
+    ]
+
+    doc.build(story)
+    buf.seek(0)
+    fname = f"taxilog_design_{date.today().isoformat()}.pdf"
+    return StreamingResponse(buf, media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={fname}"})
 
 # ── entry point ──────────────────────────────────────────────────
 
