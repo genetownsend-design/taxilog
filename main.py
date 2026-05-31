@@ -941,11 +941,33 @@ ADMIN_HTML = """{% extends "base.html" %}
       {% endfor %}
       </tbody>
     </table></div>
-    {% if admin_secret_set %}
-    <div style="padding:12px 20px;font-size:12px;color:var(--text3)">
-      To add an administrator: share the <a href="/admin/register" class="auth-link">/admin/register</a> URL along with the admin secret key.
+    <div style="padding:12px 20px;border-top:1px solid var(--border)">
+      <button type="button" class="btn btn-sm btn-secondary"
+              onclick="var p=document.getElementById('addAdminPanel');p.style.display=p.style.display==='none'?'block':'none'">
+        ➕ Add Admin
+      </button>
+      <div id="addAdminPanel" style="display:none;margin-top:14px">
+        <form action="/admin/create-admin" method="post" class="setup-form" style="max-width:340px">
+          <div class="field-group">
+            <label class="field-label">Username <span class="required">*</span></label>
+            <input type="text" name="username" class="field-input" required autocomplete="off" placeholder="Choose a username">
+          </div>
+          <div class="field-group">
+            <label class="field-label">Password <span class="required">*</span></label>
+            <input type="password" name="password" class="field-input" required placeholder="••••••••" minlength="6">
+          </div>
+          <div class="field-group" style="margin-bottom:14px">
+            <label class="field-label">Confirm Password <span class="required">*</span></label>
+            <input type="password" name="confirm" class="field-input" required placeholder="••••••••" minlength="6">
+          </div>
+          <div style="display:flex;gap:8px">
+            <button type="submit" class="btn btn-sm btn-primary">Create Admin Account</button>
+            <button type="button" class="btn btn-sm btn-secondary"
+                    onclick="document.getElementById('addAdminPanel').style.display='none'">Cancel</button>
+          </div>
+        </form>
+      </div>
     </div>
-    {% endif %}
   </div>
 
   <!-- Deactivated Accounts -->
@@ -2511,8 +2533,32 @@ async def admin_dashboard(request: Request):
     data = _admin_dashboard_data(ctx)
     reset_url  = request.query_params.get("reset_url", "")
     reset_for  = request.query_params.get("reset_for", "")
+    if request.query_params.get("msg"):
+        data["msg"]      = request.query_params.get("msg")
+        data["msg_type"] = request.query_params.get("msg_type", "ok")
     return _tmpl("admin.html", request, {**data, **_ctx_tmpl(ctx),
                                          "reset_url": reset_url, "reset_for": reset_for})
+
+@app.post("/admin/create-admin")
+async def admin_create_admin(request: Request,
+        username: str = Form(...), password: str = Form(...), confirm: str = Form(...)):
+    _require_admin(request)
+    def err(msg):
+        return RedirectResponse(f"/admin?msg={quote(msg)}&msg_type=err", status_code=303)
+    if not username.strip():
+        return err("Username is required.")
+    if len(password) < 6:
+        return err("Password must be at least 6 characters.")
+    if password != confirm:
+        return err("Passwords do not match.")
+    users = _read_users()
+    if any(u["username"].lower() == username.lower() for u in users):
+        return err(f"Username '{username}' is already taken.")
+    users.append({"id": str(uuid.uuid4()), "username": username.strip(),
+                  "password_hash": _hash_pw(password), "role": "admin",
+                  "active": True, "created_at": datetime.utcnow().isoformat()})
+    _write_users(users)
+    return RedirectResponse(f"/admin?msg={quote('Admin account created for ' + username.strip())}&msg_type=ok", status_code=303)
 
 @app.post("/admin/driver/{driver_id}/reset")
 async def admin_driver_reset(driver_id: str, request: Request):
