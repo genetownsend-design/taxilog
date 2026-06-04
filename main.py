@@ -2542,23 +2542,29 @@ async def admin_dashboard(request: Request):
 @app.post("/admin/create-admin")
 async def admin_create_admin(request: Request,
         username: str = Form(...), password: str = Form(...), confirm: str = Form(...)):
-    _require_admin(request)
+    ctx = _require_admin(request)
     def err(msg):
         return RedirectResponse(f"/admin?msg={quote(msg)}&msg_type=err", status_code=303)
-    if not username.strip():
+    username = username.strip()
+    if not username:
         return err("Username is required.")
     if len(password) < 6:
         return err("Password must be at least 6 characters.")
+    if len(password) > 128:
+        return err("Password must be 128 characters or fewer.")
     if password != confirm:
         return err("Passwords do not match.")
     users = _read_users()
     if any(u["username"].lower() == username.lower() for u in users):
         return err(f"Username '{username}' is already taken.")
-    users.append({"id": str(uuid.uuid4()), "username": username.strip(),
+    users.append({"id": str(uuid.uuid4()), "username": username,
                   "password_hash": _hash_pw(password), "role": "admin",
                   "active": True, "created_at": datetime.utcnow().isoformat()})
-    _write_users(users)
-    return RedirectResponse(f"/admin?msg={quote('Admin account created for ' + username.strip())}&msg_type=ok", status_code=303)
+    try:
+        _write_users(users)
+    except Exception:
+        return err("Failed to save user — please try again.")
+    return RedirectResponse(f"/admin?msg={quote('Admin account created for ' + username)}&msg_type=ok", status_code=303)
 
 @app.post("/admin/driver/{driver_id}/reset")
 async def admin_driver_reset(driver_id: str, request: Request):
