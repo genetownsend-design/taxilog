@@ -16,6 +16,6 @@ gcloud run deploy taxilog \
   --image $IMAGE \
   --region us-central1 \
   --allow-unauthenticated \
-  --set-env-vars "GCS_BUCKET=${GCS_BUCKET},SECRET_KEY=${SECRET_KEY},ADMIN_SECRET=${ADMIN_SECRET}" \
+  --set-env-vars "GCS_BUCKET=${GCS_BUCKET},SECRET_KEY=${SECRET_KEY},ADMIN_SECRET=${ADMIN_SECRET},GOOGLE_MAPS_KEY=${GOOGLE_MAPS_KEY},ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" \
   --memory 512Mi \
   --project $PROJECT

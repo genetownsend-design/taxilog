@@ -7,3 +7,4 @@ reportlab
 google-cloud-storage
 itsdangerous
 bcrypt
+anthropic

@@ -396,6 +396,37 @@ INDEX_HTML = """{% extends "base.html" %}
     </div>
   </section>
 
+{% if ask_enabled %}
+  <section class="panel">
+    <div class="panel-header">
+      <div class="panel-title">🤖 Ask About Your Data</div>
+    </div>
+    <div class="panel-body">
+      <div class="row-2" style="margin-bottom:12px">
+        <div class="field-group">
+          <label class="field-label">From</label>
+          <input type="date" id="askFrom" class="field-input">
+        </div>
+        <div class="field-group">
+          <label class="field-label">To</label>
+          <input type="date" id="askTo" class="field-input">
+        </div>
+      </div>
+      <div class="field-group" style="margin-bottom:12px">
+        <label class="field-label">Question</label>
+        <textarea id="askQuestion" class="field-input" rows="2" placeholder="e.g. What percentage of my pickups are voucher runs?"></textarea>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-primary" onclick="submitAsk()">Ask</button>
+        <button class="btn btn-ghost" onclick="clearAsk()">Clear</button>
+      </div>
+      <div id="askResult" style="margin-top:16px;display:none">
+        <div style="border-top:1px solid var(--border);padding-top:14px;white-space:pre-wrap;font-size:14px;line-height:1.7;color:var(--text)" id="askAnswer"></div>
+      </div>
+    </div>
+  </section>
+{% endif %}
+
 </div>
 {% endblock %}
 {% block extra_js %}
@@ -1809,6 +1840,37 @@ async function deleteAll(){
   else showToast('Error during deletion');
 }
 
+/* --- Ask panel --- */
+(function(){
+  const today=new Date();
+  const pad=n=>String(n).padStart(2,'0');
+  const fmt=d=>d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());
+  const ago=new Date(today); ago.setDate(ago.getDate()-30);
+  const f=document.getElementById('askFrom');
+  const t=document.getElementById('askTo');
+  if(f)f.value=fmt(ago);
+  if(t)t.value=fmt(today);
+})();
+async function submitAsk(){
+  const q=document.getElementById('askQuestion').value.trim();
+  if(!q)return;
+  const from=document.getElementById('askFrom').value;
+  const to=document.getElementById('askTo').value;
+  const result=document.getElementById('askResult');
+  const answer=document.getElementById('askAnswer');
+  result.style.display='block';
+  answer.textContent='Thinking…';
+  const r=await fetch('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({question:q,from_date:from,to_date:to})});
+  const d=await r.json();
+  answer.textContent=d.answer||d.error||'No response.';
+}
+function clearAsk(){
+  document.getElementById('askQuestion').value='';
+  document.getElementById('askResult').style.display='none';
+  document.getElementById('askAnswer').textContent='';
+}
+
 /* --- Expense Modal --- */
 function openExpenseModal(){
   const d=document.getElementById('logDate');
@@ -2124,6 +2186,7 @@ _GCS_BUCKET       = os.environ.get("GCS_BUCKET")
 _SECRET_KEY       = os.environ.get("SECRET_KEY", "dev-only-insecure-key")
 _ADMIN_SECRET     = os.environ.get("ADMIN_SECRET", "")
 _GOOGLE_MAPS_KEY  = os.environ.get("GOOGLE_MAPS_KEY", "")
+_ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
 _signer       = URLSafeTimedSerializer(_SECRET_KEY)
 _SESSION_MAX  = 86400 * 30   # 30-day sessions
 _VIEW_MAX     = 3600 * 4     # 4-hour impersonation window
@@ -2922,7 +2985,9 @@ async def index(request: Request):
     profile = _read_profile(ctx.effective_id)
     if not profile: return RedirectResponse("/setup", status_code=303)
     return _tmpl("index.html", request, {"profile": profile, "today": date.today().isoformat(),
-                                         "google_maps_key": _GOOGLE_MAPS_KEY, **_ctx_tmpl(ctx)})
+                                         "google_maps_key": _GOOGLE_MAPS_KEY,
+                                         "ask_enabled": bool(_ANTHROPIC_KEY),
+                                         **_ctx_tmpl(ctx)})
 
 @app.get("/setup", response_class=HTMLResponse)
 async def setup_page(request: Request):
@@ -3174,6 +3239,56 @@ async def report(request: Request, from_date: str = "", to_date: str = ""):
     summary["driver_earnings"] = round(summary["owed_driver"] + summary["meter_cash"] + summary["tip_cash"] - total_exp, 2)
     summary["pay_mode"]      = profile.get("pay_mode", "standard")
     return {"days": days, "summary": summary}
+
+# ── Ask (AI analysis) ────────────────────────────────────────────
+
+@app.post("/api/ask")
+async def ask(request: Request):
+    if not _ANTHROPIC_KEY:
+        raise HTTPException(status_code=503, detail="AI analysis not configured.")
+    did     = _auth(request)
+    body    = await request.json()
+    question   = str(body.get("question", "")).strip()
+    from_date  = str(body.get("from_date", ""))
+    to_date    = str(body.get("to_date", ""))
+    if not question:
+        raise HTTPException(status_code=400, detail="No question provided.")
+
+    profile      = _read_profile(did) or {}
+    pickups      = _read(PICKUPS_F, did)
+    expenses_all = _read(EXPENSES_F, did)
+    shifts_all   = _read(SHIFTS_F, did)
+
+    if from_date:
+        pickups      = [p for p in pickups      if p.get("pickup_date","") >= from_date]
+        expenses_all = [e for e in expenses_all if e.get("date","")        >= from_date]
+        shifts_all   = [s for s in shifts_all   if s.get("date","")        >= from_date]
+    if to_date:
+        pickups      = [p for p in pickups      if p.get("pickup_date","") <= to_date]
+        expenses_all = [e for e in expenses_all if e.get("date","")        <= to_date]
+        shifts_all   = [s for s in shifts_all   if s.get("date","")        <= to_date]
+
+    date_range = f"{from_date or 'all time'} to {to_date or 'all time'}"
+    system = f"""You are a data analyst for a taxi driver. Answer the driver's question using only the data provided.
+Driver profile: {json.dumps(profile)}
+Date range: {date_range}
+Pickups ({len(pickups)} records): {json.dumps(pickups)}
+Expenses ({len(expenses_all)} records): {json.dumps(expenses_all)}
+Shifts ({len(shifts_all)} records): {json.dumps(shifts_all)}
+Be concise and precise. Use numbers and percentages where relevant. If the data is insufficient to answer, say so."""
+
+    try:
+        import anthropic as _anthropic
+        client = _anthropic.Anthropic(api_key=_ANTHROPIC_KEY)
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": question}],
+            system=system,
+        )
+        return {"answer": msg.content[0].text}
+    except Exception as e:
+        return {"error": str(e)}
 
 # ── CSV export ───────────────────────────────────────────────────
 
