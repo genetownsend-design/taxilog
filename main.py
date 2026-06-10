@@ -3268,14 +3268,65 @@ async def ask(request: Request):
         expenses_all = [e for e in expenses_all if e.get("date","")        <= to_date]
         shifts_all   = [s for s in shifts_all   if s.get("date","")        <= to_date]
 
+    # Pre-compute summaries in Python so Claude reads accurate numbers
+    from collections import defaultdict
+
+    # Expense summaries
+    exp_by_cat: dict = defaultdict(float)
+    for e in expenses_all:
+        exp_by_cat[e.get("category","Other")] = round(exp_by_cat[e.get("category","Other")] + float(e.get("amount",0)), 2)
+    exp_total = round(sum(exp_by_cat.values()), 2)
+
+    # Pickup summaries
+    pay_counts: dict = defaultdict(int)
+    pay_meter: dict  = defaultdict(float)
+    pay_tips: dict   = defaultdict(float)
+    dest_counts: dict = defaultdict(int)
+    dest_meter: dict  = defaultdict(float)
+    for p in pickups:
+        pm  = p.get("payment_method","Unknown")
+        dst = p.get("destination_address","").strip()
+        pay_counts[pm]  += 1
+        pay_meter[pm]   = round(pay_meter[pm]  + float(p.get("meter_total",0)), 2)
+        pay_tips[pm]    = round(pay_tips[pm]   + float(p.get("tip",0)), 2)
+        if dst:
+            dest_counts[dst] += 1
+            dest_meter[dst]   = round(dest_meter[dst] + float(p.get("meter_total",0)), 2)
+    total_meter  = round(sum(pay_meter.values()), 2)
+    total_tips   = round(sum(pay_tips.values()), 2)
+    total_fares  = round(sum(float(p.get("calculated_total",0)) for p in pickups), 2)
+    avg_meter    = round(total_meter / len(pickups), 2) if pickups else 0
+    dest_avg     = {d: round(dest_meter[d] / dest_counts[d], 2) for d in dest_counts}
+
+    # Shift summaries
+    total_miles = round(sum(float(s.get("miles",0)) for s in shifts_all), 2)
+
+    summaries = {
+        "pickup_count": len(pickups),
+        "total_meter": total_meter,
+        "total_tips": total_tips,
+        "total_fares": total_fares,
+        "avg_meter_per_trip": avg_meter,
+        "pickups_by_payment": dict(pay_counts),
+        "meter_by_payment": dict(pay_meter),
+        "tips_by_payment": dict(pay_tips),
+        "expense_total": exp_total,
+        "expenses_by_category": dict(exp_by_cat),
+        "trip_count_by_destination": dict(dest_counts),
+        "avg_meter_by_destination": dest_avg,
+        "total_miles": total_miles,
+    }
+
     date_range = f"{from_date or 'all time'} to {to_date or 'all time'}"
     system = f"""You are a data analyst for a taxi driver. Answer the driver's question using only the data provided.
+IMPORTANT: Use the pre-computed summaries for any totals, counts, averages, or percentages — do not re-add the raw records yourself.
 Driver profile: {json.dumps(profile)}
 Date range: {date_range}
-Pickups ({len(pickups)} records): {json.dumps(pickups)}
-Expenses ({len(expenses_all)} records): {json.dumps(expenses_all)}
-Shifts ({len(shifts_all)} records): {json.dumps(shifts_all)}
-Be concise and precise. Use numbers and percentages where relevant. If the data is insufficient to answer, say so."""
+Pre-computed summaries (accurate): {json.dumps(summaries)}
+Raw pickup records ({len(pickups)}): {json.dumps(pickups)}
+Raw expense records ({len(expenses_all)}): {json.dumps(expenses_all)}
+Raw shift records ({len(shifts_all)}): {json.dumps(shifts_all)}
+Be concise and precise. If the data is insufficient to answer, say so."""
 
     try:
         import anthropic as _anthropic
