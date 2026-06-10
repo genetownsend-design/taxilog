@@ -176,6 +176,17 @@ BASE_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Map Modal -->
+<div id="mapModal" class="modal-overlay" style="display:none">
+  <div class="modal-box modal-wide">
+    <div class="modal-header">
+      <h2>Map</h2>
+      <button class="modal-close" onclick="closeModal('mapModal')">✕</button>
+    </div>
+    <div class="modal-body" id="mapModalBody"></div>
+  </div>
+</div>
+
 <!-- Expense Modal -->
 <div id="expenseModal" class="modal-overlay" style="display:none">
   <div class="modal-box">
@@ -388,6 +399,7 @@ INDEX_HTML = """{% extends "base.html" %}
 </div>
 {% endblock %}
 {% block extra_js %}
+<script>const GMAPS_KEY="{{google_maps_key}}";</script>
 <script>
   (function(){
     const d = new Date(); d.setMinutes(d.getMinutes()+20);
@@ -1609,6 +1621,7 @@ function renderLog(pickups){
       +'</div>'
       +'<div class="pickup-card-foot">'
         +'<button class="btn btn-sm btn-ghost" data-action="edit" data-id="'+p.id+'">Edit</button>'
+        +(p.destination_address?'<button class="btn btn-sm btn-primary" data-action="map" data-id="'+p.id+'">Map</button>':'')
         +'<button class="btn btn-sm btn-danger" data-action="delete" data-id="'+p.id+'">Delete</button>'
       +'</div>'
     +'</div>';
@@ -1621,10 +1634,70 @@ document.addEventListener('click',e=>{
   if(!btn)return;
   const id=btn.dataset.id;
   if(btn.dataset.action==='edit')openEdit(id);
+  if(btn.dataset.action==='map')openMapModal(id);
   if(btn.dataset.action==='delete')deletePickup(id);
   if(btn.dataset.action==='del-expense')deleteExpense(id);
   if(btn.dataset.action==='cancel-edit')closeModal('editModal');
 });
+
+async function openMapModal(id){
+  const p=await fetch('/api/pickups/'+id).then(r=>r.json());
+  const pickup=p.street_address+(p.city?', '+p.city:'');
+  const dest=p.destination_address||'';
+  const body=document.getElementById('mapModalBody');
+  if(!GMAPS_KEY){
+    const url='https://www.google.com/maps/dir/Current+Location/'+encodeURIComponent(pickup);
+    body.innerHTML='<p style="margin-bottom:12px;color:var(--text2)">No Maps API key configured — opening in Google Maps.</p>'
+      +'<a href="'+url+'" target="_blank" class="btn btn-primary">Open in Google Maps</a>';
+    window.open(url,'_blank');
+    openModal('mapModal');
+    return;
+  }
+  body.innerHTML='<div style="display:flex;flex-direction:column;gap:12px;padding:8px 0">'
+    +'<p style="margin:0;font-size:14px;color:var(--text2)">Where do you want directions to?</p>'
+    +'<div style="display:flex;gap:10px">'
+      +'<button class="btn btn-primary" style="flex:1" onclick="startMapToPickup()">To Pickup</button>'
+      +(dest?'<button class="btn btn-ghost" style="flex:1" onclick="startMapToDest()">To Destination</button>':'')
+    +'</div>'
+    +'</div>';
+  window._mapPickup=pickup;
+  window._mapDest=dest;
+  openModal('mapModal');
+}
+
+function startMapToPickup(){startMap(window._mapPickup);}
+function startMapToDest(){startMap(window._mapDest);}
+async function startMap(target){
+  const body=document.getElementById('mapModalBody');
+  body.innerHTML='<p style="color:var(--text3);font-size:13px">Getting your location…</p>';
+  const doRoute=origin=>{
+    body.innerHTML='<div id="gmapDiv" style="width:100%;height:360px;border-radius:8px;margin-bottom:12px"></div>'
+      +'<div id="gmapPanel" style="font-size:13px;line-height:1.6;max-height:300px;overflow-y:auto"></div>';
+    const map=new google.maps.Map(document.getElementById('gmapDiv'),{zoom:12,center:{lat:37.5,lng:-122.0}});
+    const svc=new google.maps.DirectionsService();
+    const rend=new google.maps.DirectionsRenderer({map,panel:document.getElementById('gmapPanel')});
+    svc.route({origin,destination:target,travelMode:google.maps.TravelMode.DRIVING},(res,status)=>{
+      if(status==='OK') rend.setDirections(res);
+      else body.innerHTML='<p style="color:var(--red)">Directions error: '+status+'<br><small>Ensure the Directions API is enabled and in the key API restrictions list.</small></p>';
+    });
+  };
+  if(!window.google||!window.google.maps){
+    await new Promise((res,rej)=>{
+      const s=document.createElement('script');
+      s.src='https://maps.googleapis.com/maps/api/js?key='+GMAPS_KEY;
+      s.onload=res; s.onerror=rej;
+      document.head.appendChild(s);
+    });
+  }
+  if(navigator.geolocation){
+    navigator.geolocation.getCurrentPosition(
+      pos=>doRoute({lat:pos.coords.latitude,lng:pos.coords.longitude}),
+      ()=>doRoute(target)
+    );
+  }else{
+    doRoute(target);
+  }
+}
 
 function renderTotals(t){
   const tp=document.getElementById('dailyTotals');
@@ -2047,9 +2120,10 @@ for _rel, _content in _ASSETS.items():
 # HELPERS
 # ════════════════════════════════════════════════════════════════
 
-_GCS_BUCKET   = os.environ.get("GCS_BUCKET")
-_SECRET_KEY   = os.environ.get("SECRET_KEY", "dev-only-insecure-key")
-_ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
+_GCS_BUCKET       = os.environ.get("GCS_BUCKET")
+_SECRET_KEY       = os.environ.get("SECRET_KEY", "dev-only-insecure-key")
+_ADMIN_SECRET     = os.environ.get("ADMIN_SECRET", "")
+_GOOGLE_MAPS_KEY  = os.environ.get("GOOGLE_MAPS_KEY", "")
 _signer       = URLSafeTimedSerializer(_SECRET_KEY)
 _SESSION_MAX  = 86400 * 30   # 30-day sessions
 _VIEW_MAX     = 3600 * 4     # 4-hour impersonation window
@@ -2848,7 +2922,7 @@ async def index(request: Request):
     profile = _read_profile(ctx.effective_id)
     if not profile: return RedirectResponse("/setup", status_code=303)
     return _tmpl("index.html", request, {"profile": profile, "today": date.today().isoformat(),
-                                         **_ctx_tmpl(ctx)})
+                                         "google_maps_key": _GOOGLE_MAPS_KEY, **_ctx_tmpl(ctx)})
 
 @app.get("/setup", response_class=HTMLResponse)
 async def setup_page(request: Request):
@@ -3589,9 +3663,10 @@ async def admin_design_pdf(request: Request):
         Paragraph("Environment variables (set via --set-env-vars in deploy.sh):", h3),
         T([1.6*inch, 1.3*inch, 3.6*inch], [
             ["Variable",      "Required", "Purpose"],
-            ["GCS_BUCKET",    "Yes",      "GCS bucket name. When absent, data is stored in local ./data/ files (dev mode)."],
-            ["SECRET_KEY",    "Yes",      "Signing key for itsdangerous. Must be a long random hex string."],
-            ["ADMIN_SECRET",  "Yes",      "Passphrase required on the admin registration form. Keep private."],
+            ["GCS_BUCKET",        "Yes",  "GCS bucket name. When absent, data is stored in local ./data/ files (dev mode)."],
+            ["SECRET_KEY",        "Yes",  "Signing key for itsdangerous. Must be a long random hex string."],
+            ["ADMIN_SECRET",      "Yes",  "Passphrase required on the admin registration form. Keep private."],
+            ["GOOGLE_MAPS_KEY",   "No",   "Google Maps Embed API key. Enables inline map overlay; if absent, map opens in a new tab."],
             ["PORT",          "Auto",     "Set by Cloud Run. App reads os.environ.get('PORT', 8000) at startup."],
         ]),
         sp(6),

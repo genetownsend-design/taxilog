@@ -84,3 +84,4 @@ Since templates and static files are string constants in `main.py`, edit them th
 | `GCS_BUCKET` | Yes | Switches storage to GCS; absence means local filesystem |
 | `SECRET_KEY` | Yes | Signs session cookies (defaults to insecure dev key) |
 | `ADMIN_SECRET` | Yes | Required to access `/admin/register` to create admin accounts |
+| `GOOGLE_MAPS_KEY` | No | Google Maps Embed API key — enables inline map overlay in pickup cards; if absent, Map button opens Google Maps in a new tab |
