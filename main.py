@@ -1672,10 +1672,19 @@ document.addEventListener('click',e=>{
 });
 
 async function openMapModal(id){
-  const p=await fetch('/api/pickups/'+id).then(r=>r.json());
+  const body=document.getElementById('mapModalBody');
+  let p;
+  try{
+    const r=await fetch('/api/pickups/'+id);
+    if(!r.ok) throw new Error('Could not load pickup.');
+    p=await r.json();
+  }catch(e){
+    body.innerHTML='<p style="color:var(--red)">Could not load pickup data. Please try again.</p>';
+    openModal('mapModal');
+    return;
+  }
   const pickup=p.street_address+(p.city?', '+p.city:'');
   const dest=p.destination_address||'';
-  const body=document.getElementById('mapModalBody');
   if(!GMAPS_KEY){
     const url='https://www.google.com/maps/dir/Current+Location/'+encodeURIComponent(pickup);
     body.innerHTML='<p style="margin-bottom:12px;color:var(--text2)">No Maps API key configured — opening in Google Maps.</p>'
@@ -1696,6 +1705,20 @@ async function openMapModal(id){
   openModal('mapModal');
 }
 
+function _mapDirError(body,status){
+  const msgs={
+    NOT_FOUND:'Address not recognized — check the pickup or destination address.',
+    ZERO_RESULTS:'No drivable route found between these locations.',
+    REQUEST_DENIED:'Maps API request denied — check that the Directions API is enabled and authorized for this key.',
+    OVER_QUERY_LIMIT:'Maps API rate limit reached — please wait a moment and try again.',
+    OVER_DAILY_LIMIT:'Maps API billing limit reached — check your Google Cloud billing account.',
+    INVALID_REQUEST:'Invalid request — the address may be missing or incomplete.',
+    UNKNOWN_ERROR:'Google Maps returned an unknown error — please try again.'
+  };
+  const msg=msgs[status]||('Directions unavailable ('+status+').');
+  body.innerHTML='<p style="color:var(--red);font-size:14px">'+msg+'</p>';
+}
+
 function startMapToPickup(){startMap(window._mapPickup);}
 function startMapToDest(){startMap(window._mapDest);}
 async function startMap(target){
@@ -1709,21 +1732,27 @@ async function startMap(target){
     const rend=new google.maps.DirectionsRenderer({map,panel:document.getElementById('gmapPanel')});
     svc.route({origin,destination:target,travelMode:google.maps.TravelMode.DRIVING},(res,status)=>{
       if(status==='OK') rend.setDirections(res);
-      else body.innerHTML='<p style="color:var(--red)">Directions error: '+status+'<br><small>Ensure the Directions API is enabled and in the key API restrictions list.</small></p>';
+      else _mapDirError(body,status);
     });
   };
   if(!window.google||!window.google.maps){
-    await new Promise((res,rej)=>{
-      const s=document.createElement('script');
-      s.src='https://maps.googleapis.com/maps/api/js?key='+GMAPS_KEY;
-      s.onload=res; s.onerror=rej;
-      document.head.appendChild(s);
-    });
+    try{
+      await new Promise((res,rej)=>{
+        const s=document.createElement('script');
+        s.src='https://maps.googleapis.com/maps/api/js?key='+GMAPS_KEY;
+        s.onload=res; s.onerror=rej;
+        document.head.appendChild(s);
+      });
+    }catch(e){
+      body.innerHTML='<p style="color:var(--red);font-size:14px">Could not load Google Maps — check your internet connection.</p>';
+      return;
+    }
   }
   if(navigator.geolocation){
     navigator.geolocation.getCurrentPosition(
       pos=>doRoute({lat:pos.coords.latitude,lng:pos.coords.longitude}),
-      ()=>doRoute(target)
+      ()=>doRoute(target),
+      {timeout:10000,maximumAge:60000}
     );
   }else{
     doRoute(target);
