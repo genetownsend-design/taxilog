@@ -3301,8 +3301,46 @@ async def ask(request: Request):
     # Shift summaries
     total_miles = round(sum(float(s.get("miles",0)) for s in shifts_all), 2)
 
+    # Day-level aggregations
+    days_with_pickups  = sorted(set(p.get("pickup_date","") for p in pickups if p.get("pickup_date")))
+    days_with_expenses = sorted(set(e.get("date","") for e in expenses_all if e.get("date")))
+    days_with_shifts   = sorted(set(s.get("date","") for s in shifts_all if s.get("date")))
+    pickups_per_day    = {}
+    meter_per_day: dict = defaultdict(float)
+    tips_per_day: dict  = defaultdict(float)
+    for p in pickups:
+        d = p.get("pickup_date","")
+        if d:
+            pickups_per_day[d] = pickups_per_day.get(d, 0) + 1
+            meter_per_day[d]   = round(meter_per_day[d] + float(p.get("meter_total",0)), 2)
+            tips_per_day[d]    = round(tips_per_day[d]  + float(p.get("tip",0)), 2)
+
+    # Pickup count by day of week
+    from datetime import date as _date
+    dow_counts: dict = defaultdict(int)
+    dow_meter: dict  = defaultdict(float)
+    dow_names = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+    for p in pickups:
+        try:
+            d = p.get("pickup_date","")
+            if d:
+                dow = _date.fromisoformat(d).weekday()
+                dow_counts[dow_names[dow]] += 1
+                dow_meter[dow_names[dow]] = round(dow_meter[dow_names[dow]] + float(p.get("meter_total",0)), 2)
+        except (ValueError, IndexError):
+            pass
+
     summaries = {
         "pickup_count": len(pickups),
+        "days_with_pickups": len(days_with_pickups),
+        "days_with_pickups_list": days_with_pickups,
+        "days_with_expenses": len(days_with_expenses),
+        "days_with_shifts": len(days_with_shifts),
+        "pickups_per_day": pickups_per_day,
+        "meter_per_day": dict(meter_per_day),
+        "tips_per_day": dict(tips_per_day),
+        "pickups_by_day_of_week": dict(dow_counts),
+        "meter_by_day_of_week": dict(dow_meter),
         "total_meter": total_meter,
         "total_tips": total_tips,
         "total_fares": total_fares,
