@@ -3325,7 +3325,7 @@ Be concise and precise. If the data is insufficient to answer, say so."""
         client = _anthropic.Anthropic(api_key=_ANTHROPIC_KEY)
         msg = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=1024,
+            max_tokens=4096,
             messages=[{"role": "user", "content": question}],
             system=system,
         )
