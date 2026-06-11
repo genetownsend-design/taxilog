@@ -3325,11 +3325,14 @@ Be concise and precise. If the data is insufficient to answer, say so."""
         client = _anthropic.Anthropic(api_key=_ANTHROPIC_KEY)
         msg = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=4096,
+            max_tokens=8192,
             messages=[{"role": "user", "content": question}],
             system=system,
         )
-        return {"answer": msg.content[0].text}
+        text = msg.content[0].text
+        if msg.stop_reason == "max_tokens":
+            text += "\n\n(Response cut off — answer exceeded token limit. Try asking a more specific question.)"
+        return {"answer": text}
     except Exception as e:
         return {"error": str(e)}
 
