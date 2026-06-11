@@ -3298,7 +3298,8 @@ async def ask(request: Request):
         shifts_all   = [s for s in shifts_all   if s.get("date","")        <= to_date]
 
     date_range = f"{from_date or 'all time'} to {to_date or 'all time'}"
-    system = f"""You are a data analyst for a taxi driver. Answer the driver's question using only the data provided. Calculate all totals, averages, and counts directly from the raw records.
+    verified_totals = day_totals(pickups, profile)
+    system = f"""You are a data analyst for a taxi driver. Answer the driver's question using only the data provided.
 
 Pickup record field glossary:
 - payment_method: how the FARE (meter amount) was paid — Cash, Credit, or Voucher
@@ -3308,6 +3309,9 @@ Pickup record field glossary:
 - calculated_total: total charged (meter + tip)
 - pickup_date: date of pickup (YYYY-MM-DD)
 - pickup_time: time of pickup
+
+Pre-verified totals for the date range (calculated by the app's canonical day_totals function — treat these as ground truth for aggregate figures):
+{json.dumps(verified_totals)}
 
 Driver profile: {json.dumps(profile)}
 Date range: {date_range}
@@ -3320,7 +3324,7 @@ Be concise and precise. If the data is insufficient to answer, say so."""
         import anthropic as _anthropic
         client = _anthropic.Anthropic(api_key=_ANTHROPIC_KEY)
         msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-sonnet-4-6",
             max_tokens=1024,
             messages=[{"role": "user", "content": question}],
             system=system,
