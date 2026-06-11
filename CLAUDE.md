@@ -12,6 +12,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Goal-driven execution.** Every line written should serve the stated goal. Stop when the goal is met. Do not add features, defensive handling, or polish that was not asked for.
 
+**Handle all outcomes.** Always research all potential return codes, status codes, and error responses for any API or service being integrated. Do not assume the happy path. Every distinct failure mode should produce a clear, accurate message — not a generic fallback that misleads the user about what went wrong.
+
 ## Running Locally
 
 ```bash
