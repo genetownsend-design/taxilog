@@ -3299,6 +3299,16 @@ async def ask(request: Request):
 
     date_range = f"{from_date or 'all time'} to {to_date or 'all time'}"
     system = f"""You are a data analyst for a taxi driver. Answer the driver's question using only the data provided. Calculate all totals, averages, and counts directly from the raw records.
+
+Pickup record field glossary:
+- payment_method: how the FARE (meter amount) was paid — Cash, Credit, or Voucher
+- tip_payment_method: how the TIP was paid — Cash, Credit, or Voucher (may differ from payment_method; may be blank if no tip)
+- tip: tip amount in dollars
+- meter_total: metered fare amount in dollars
+- calculated_total: total charged (meter + tip)
+- pickup_date: date of pickup (YYYY-MM-DD)
+- pickup_time: time of pickup
+
 Driver profile: {json.dumps(profile)}
 Date range: {date_range}
 Pickup records ({len(pickups)}): {json.dumps(pickups)}
