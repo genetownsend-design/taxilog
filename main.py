@@ -397,7 +397,7 @@ INDEX_HTML = """{% extends "base.html" %}
   </section>
 
 {% if ask_enabled %}
-  <section class="panel">
+  <section class="panel" style="overflow:visible">
     <div class="panel-header">
       <div class="panel-title">🤖 Ask About Your Data</div>
     </div>
