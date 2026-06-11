@@ -421,7 +421,7 @@ INDEX_HTML = """{% extends "base.html" %}
         <button class="btn btn-ghost" onclick="clearAsk()">Clear</button>
       </div>
       <div id="askResult" style="margin-top:16px;display:none">
-        <div style="border-top:1px solid var(--border);padding-top:14px;white-space:pre-wrap;font-size:14px;line-height:1.7;color:var(--text)" id="askAnswer"></div>
+        <div style="border-top:1px solid var(--border);padding-top:14px;white-space:pre-wrap;font-size:14px;line-height:1.7;color:var(--text);max-height:60vh;overflow-y:auto" id="askAnswer"></div>
       </div>
     </div>
   </section>
