@@ -2480,6 +2480,10 @@ def day_totals(recs, profile=None):
 def calc_total(meter: float, tip: float) -> float:
     return round((meter or 0) + (tip or 0), 2)
 
+def _money(v) -> float:
+    # request values arrive as '', None, '12.5', or a number — default to 0
+    return float(v or 0)
+
 def upsert_customer(name, address, city, phone, driver_id: str = ""):
     if not name: return
     customers = _read(CUSTOMERS_F, driver_id)
@@ -3133,25 +3137,23 @@ async def get_pickups(request: Request, date: Optional[str] = None):
     if date: pickups = [p for p in pickups if p.get("pickup_date") == date]
     return sorted(pickups, key=lambda p: p.get("pickup_time",""))
 
+# the client-editable pickup fields, in record/JSON key order — shared by
+# create (defaults) and update (copy-if-present) so the list lives once
+_PICKUP_FIELDS = ("pickup_date", "pickup_time", "street_address", "city",
+                  "customer_name", "phone_number", "destination_address",
+                  "meter_total", "payment_method", "tip", "tip_payment_method")
+
 @app.post("/api/pickups")
 async def create_pickup(request: Request):
     did = _auth_write(request)
     body = await request.json()
-    m, t = float(body.get("meter_total") or 0), float(body.get("tip") or 0)
-    record = {
-        "id": str(uuid.uuid4()),
-        "pickup_date": body.get("pickup_date",""),
-        "pickup_time": body.get("pickup_time",""),
-        "street_address": body.get("street_address",""),
-        "city": body.get("city",""),
-        "customer_name": body.get("customer_name",""),
-        "phone_number": body.get("phone_number",""),
-        "destination_address": body.get("destination_address",""),
-        "meter_total": m, "payment_method": body.get("payment_method",""),
-        "tip": t, "tip_payment_method": body.get("tip_payment_method",""),
-        "calculated_total": calc_total(m, t),
-        "created_at": datetime.utcnow().isoformat(),
-    }
+    record = {"id": str(uuid.uuid4())}
+    for k in _PICKUP_FIELDS:
+        record[k] = body.get(k, "")
+    record["meter_total"]      = _money(record["meter_total"])
+    record["tip"]              = _money(record["tip"])
+    record["calculated_total"] = calc_total(record["meter_total"], record["tip"])
+    record["created_at"]       = datetime.utcnow().isoformat()
     pickups = _read(PICKUPS_F, did); pickups.append(record); _write(PICKUPS_F, pickups, did)
     upsert_customer(record["customer_name"], record["street_address"], record["city"], record["phone_number"], did)
     return record
@@ -3170,11 +3172,10 @@ async def update_pickup(pid: str, request: Request):
     idx = next((i for i,p in enumerate(pickups) if p["id"] == pid), None)
     if idx is None: raise HTTPException(404, "Not found")
     rec = pickups[idx]
-    for k in ["pickup_date","pickup_time","street_address","city","customer_name",
-              "phone_number","destination_address","meter_total","payment_method","tip","tip_payment_method"]:
+    for k in _PICKUP_FIELDS:
         if k in body: rec[k] = body[k]
-    rec["meter_total"]       = float(rec.get("meter_total") or 0)
-    rec["tip"]               = float(rec.get("tip") or 0)
+    rec["meter_total"]       = _money(rec.get("meter_total"))
+    rec["tip"]               = _money(rec.get("tip"))
     rec["calculated_total"]  = calc_total(rec["meter_total"], rec["tip"])
     pickups[idx] = rec; _write(PICKUPS_F, pickups, did)
     upsert_customer(rec["customer_name"], rec["street_address"], rec["city"], rec["phone_number"], did)
@@ -3209,7 +3210,7 @@ async def create_expense(request: Request):
         "id": str(uuid.uuid4()),
         "date": body.get("date",""),
         "category": body.get("category",""),
-        "amount": float(body.get("amount") or 0),
+        "amount": _money(body.get("amount")),
         "notes": body.get("notes",""),
         "created_at": datetime.utcnow().isoformat(),
     }
@@ -3239,8 +3240,8 @@ async def save_shift(request: Request):
     shifts = _read(SHIFTS_F, did)
     d      = body.get("date","")
     existing = next((s for s in shifts if s.get("date") == d), None)
-    odo_start = float(body.get("odometer_start") or 0)
-    odo_end   = float(body.get("odometer_end")   or 0)
+    odo_start = _money(body.get("odometer_start"))
+    odo_end   = _money(body.get("odometer_end"))
     miles     = round(max(odo_end - odo_start, 0), 1)
     if existing:
         existing.update({

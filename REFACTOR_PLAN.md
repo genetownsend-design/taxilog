@@ -140,18 +140,13 @@ URLs, methods, and responses stay identical (invariant 4). Care: `/api/backup/al
 and `/api/restore/all` must be registered before the parameterized routes, or the
 whitelist check must route them — verify with `baseline/routes.txt`.
 
-### 4.3 Auth guards become FastAPI dependencies
+### 4.3 Auth guards become FastAPI dependencies — **DROPPED (2026-07-01)**
 
-`_auth`, `_auth_write`, and `_require_admin` are currently called manually as the
-first line of ~40 handlers. Convert them to `Depends(...)` parameters:
-
-```python
-async def get_pickups(date: Optional[str] = None, driver_id: str = Depends(_auth)):
-```
-
-Same functions, same 401/403 behavior, but the guard is visible in the signature and
-impossible to forget on a future endpoint. Pure mechanical change, done one route
-group at a time.
+Skipped by decision: it would touch ~40 handlers (the widest blast radius of any
+phase) for a purely stylistic gain, and a single `_auth`/`_auth_write` mix-up would
+quietly weaken the impersonation write-block on one endpoint. The existing pattern
+(`did = _auth(request)` as the first handler line) stays. Convention going forward:
+new endpoints may use `Depends(...)`; existing ones are left untouched.
 
 ### 4.4 Consolidate request parsing per route group
 
@@ -191,7 +186,7 @@ it the cheap verification story.
 | 0 | Safety net (§3) | Baselines captured |
 | 1 | Section banners + TOC comment (§4.1) | `diff -r templates baseline/templates` & `static` clean; routes.txt identical |
 | 2 | Backup/restore dedupe (§4.2) | routes.txt identical; download each backup file + `all`; restore round-trip on scratch data |
-| 3 | Auth guards → `Depends` (§4.3), one route group per sub-commit | Full smoke checklist §6, esp. impersonation write-block (403) |
+| 3 | ~~Auth guards → `Depends` (§4.3)~~ **DROPPED** | — |
 | 4 | Request-parsing helpers (§4.4) | Pickup/expense/shift CRUD against `baseline/*.json` |
 | 5 | PDF helpers (§4.5) | Generate all four PDFs, eyeball against pre-refactor copies |
 
