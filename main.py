@@ -3602,50 +3602,42 @@ def _json_download(data, filename: str):
     return StreamingResponse(io.BytesIO(content), media_type="application/json",
                              headers={"Content-Disposition": f"attachment; filename={filename}"})
 
-@app.get("/api/backup/pickups")
-async def backup_pickups(request: Request):
-    did = _auth(request)
-    return _json_download(_read(PICKUPS_F, did), f"pickups_{date.today().isoformat()}.json")
+# url name → (data file, expects JSON array?). profile is the only dict.
+_BACKUP_FILES = {
+    "pickups":   (PICKUPS_F,   True),
+    "customers": (CUSTOMERS_F, True),
+    "expenses":  (EXPENSES_F,  True),
+    "shifts":    (SHIFTS_F,    True),
+    "profile":   (PROFILE_F,   False),
+}
 
-@app.get("/api/backup/customers")
-async def backup_customers(request: Request):
-    did = _auth(request)
-    return _json_download(_read(CUSTOMERS_F, did), f"customers_{date.today().isoformat()}.json")
+def _register_backup_restore(name: str, path: Path, expect_list: bool):
+    async def backup_file(request: Request):
+        did = _auth(request)
+        data = _read_profile(did) if name == "profile" else _read(path, did)
+        return _json_download(data, f"{name}_{date.today().isoformat()}.json")
 
-@app.get("/api/backup/expenses")
-async def backup_expenses(request: Request):
-    did = _auth(request)
-    return _json_download(_read(EXPENSES_F, did), f"expenses_{date.today().isoformat()}.json")
+    async def restore_file(request: Request, file: UploadFile = File(...)):
+        return await _restore(file, path, expect_list, _auth_write(request))
 
-@app.get("/api/backup/shifts")
-async def backup_shifts(request: Request):
-    did = _auth(request)
-    return _json_download(_read(SHIFTS_F, did), f"shifts_{date.today().isoformat()}.json")
-
-@app.get("/api/backup/profile")
-async def backup_profile(request: Request):
-    did = _auth(request)
-    return _json_download(_read_profile(did), f"profile_{date.today().isoformat()}.json")
+    # keep the original per-endpoint function names (OpenAPI operation ids)
+    backup_file.__name__  = f"backup_{name}"
+    restore_file.__name__ = f"restore_{name}"
+    app.get(f"/api/backup/{name}")(backup_file)
+    app.post(f"/api/restore/{name}")(restore_file)
 
 @app.get("/api/backup/all")
 async def backup_all(request: Request):
     did = _auth(request)
     import zipfile as zf_mod
-    files = [
-        (PICKUPS_F,   "pickups.json",   []),
-        (CUSTOMERS_F, "customers.json", []),
-        (EXPENSES_F,  "expenses.json",  []),
-        (SHIFTS_F,    "shifts.json",    []),
-        (PROFILE_F,   "profile.json",   {}),
-    ]
     buf = io.BytesIO()
     with zf_mod.ZipFile(buf, 'w', zf_mod.ZIP_DEFLATED) as zf:
-        for path, name, default in files:
-            if path == PROFILE_F:
-                data = _read_profile(did) or default
+        for name, (path, expect_list) in _BACKUP_FILES.items():
+            if name == "profile":
+                data = _read_profile(did) or {}
             else:
-                data = _read(path, did) or default
-            zf.writestr(name, json.dumps(data, indent=2, default=str))
+                data = _read(path, did) or []
+            zf.writestr(f"{name}.json", json.dumps(data, indent=2, default=str))
     buf.seek(0)
     fname = f"taxilog_backup_{date.today().isoformat()}.zip"
     return StreamingResponse(buf, media_type="application/zip",
@@ -3658,26 +3650,6 @@ async def _restore(file: UploadFile, path: Path, expect_list: bool, driver_id: s
     if not expect_list and not isinstance(data, dict): raise HTTPException(400, "Expected a JSON object")
     _write(path, data, driver_id); return {"ok": True}
 
-@app.post("/api/restore/pickups")
-async def restore_pickups(request: Request, file: UploadFile = File(...)):
-    return await _restore(file, PICKUPS_F, True, _auth_write(request))
-
-@app.post("/api/restore/customers")
-async def restore_customers(request: Request, file: UploadFile = File(...)):
-    return await _restore(file, CUSTOMERS_F, True, _auth_write(request))
-
-@app.post("/api/restore/expenses")
-async def restore_expenses(request: Request, file: UploadFile = File(...)):
-    return await _restore(file, EXPENSES_F, True, _auth_write(request))
-
-@app.post("/api/restore/shifts")
-async def restore_shifts(request: Request, file: UploadFile = File(...)):
-    return await _restore(file, SHIFTS_F, True, _auth_write(request))
-
-@app.post("/api/restore/profile")
-async def restore_profile(request: Request, file: UploadFile = File(...)):
-    return await _restore(file, PROFILE_F, False, _auth_write(request))
-
 @app.post("/api/restore/all")
 async def restore_all(request: Request, file: UploadFile = File(...)):
     did = _auth_write(request)
@@ -3685,28 +3657,26 @@ async def restore_all(request: Request, file: UploadFile = File(...)):
     try:
         data = await file.read()
         with zf_mod.ZipFile(io.BytesIO(data)) as zf:
-            mapping = {
-                "pickups.json":   (PICKUPS_F,   True),
-                "customers.json": (CUSTOMERS_F, True),
-                "expenses.json":  (EXPENSES_F,  True),
-                "shifts.json":    (SHIFTS_F,    True),
-                "profile.json":   (PROFILE_F,   False),
-            }
             restored = []
-            for name, (path, expect_list) in mapping.items():
-                if name in zf.namelist():
-                    parsed = json.loads(zf.read(name).decode())
+            for name, (path, expect_list) in _BACKUP_FILES.items():
+                fname = f"{name}.json"
+                if fname in zf.namelist():
+                    parsed = json.loads(zf.read(fname).decode())
                     if expect_list and not isinstance(parsed, list):
-                        raise HTTPException(400, f"{name}: expected JSON array")
+                        raise HTTPException(400, f"{fname}: expected JSON array")
                     if not expect_list and not isinstance(parsed, dict):
-                        raise HTTPException(400, f"{name}: expected JSON object")
+                        raise HTTPException(400, f"{fname}: expected JSON object")
                     _write(path, parsed, did)
-                    restored.append(name)
+                    restored.append(fname)
     except zf_mod.BadZipFile:
         raise HTTPException(400, "Invalid ZIP file")
     except json.JSONDecodeError:
         raise HTTPException(400, "Invalid JSON in backup file")
     return {"ok": True, "restored": restored}
+
+# register the five per-file backup/restore endpoint pairs
+for _name, (_path, _expect_list) in _BACKUP_FILES.items():
+    _register_backup_restore(_name, _path, _expect_list)
 
 # ── requirements PDF ─────────────────────────────────────────────
 
