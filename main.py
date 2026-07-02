@@ -2500,6 +2500,30 @@ def upsert_customer(name, address, city, phone, driver_id: str = ""):
                           "street_address": address or "", "city": city or "", "phone": phone or ""})
     _write(CUSTOMERS_F, customers, driver_id)
 
+# ── PDF building blocks (shared by the four PDF endpoints) ───────
+# amber theme hex values — keep in sync with the CSS palette
+_C_AMBER    = "#D97706"
+_C_DARK     = "#1C1917"
+_C_GREEN    = "#10B981"
+_C_RED      = "#EF4444"
+_C_GRID     = "#D1D5DB"
+_C_AMBER_XL = "#FFFBEB"
+
+def _pdf_doc(buf, margin: float):
+    # shared SimpleDocTemplate setup: letter pages, uniform margins (inches).
+    # reportlab imports stay function-local so startup doesn't pay for them.
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate
+    return SimpleDocTemplate(buf, pagesize=letter,
+                             leftMargin=margin*inch, rightMargin=margin*inch,
+                             topMargin=margin*inch,  bottomMargin=margin*inch)
+
+def _pdf_response(buf, filename: str):
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"})
+
 # ════════════════════════════════════════════════════════════════
 # APP + ROUTES
 # ════════════════════════════════════════════════════════════════
@@ -2926,21 +2950,18 @@ async def fleet_report_json(request: Request, from_date: str = "", to_date: str 
 
 @app.get("/api/admin/fleet-report-pdf")
 async def fleet_report_pdf(request: Request, from_date: str = "", to_date: str = ""):
-    from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle, HRFlowable
     from reportlab.lib import colors
     _require_admin(request)
     data   = _fleet_report_data(from_date, to_date)
-    amber  = colors.HexColor("#D97706")
-    dark   = colors.HexColor("#1C1917")
-    green  = colors.HexColor("#10B981")
-    red    = colors.HexColor("#EF4444")
+    amber  = colors.HexColor(_C_AMBER)
+    dark   = colors.HexColor(_C_DARK)
+    green  = colors.HexColor(_C_GREEN)
+    red    = colors.HexColor(_C_RED)
     buf    = io.BytesIO()
-    doc    = SimpleDocTemplate(buf, pagesize=letter,
-                               leftMargin=0.75*inch, rightMargin=0.75*inch,
-                               topMargin=0.75*inch,  bottomMargin=0.75*inch)
+    doc    = _pdf_doc(buf, 0.75)
     styles = getSampleStyleSheet()
     h1  = ParagraphStyle("h1", parent=styles["Heading1"], textColor=amber, fontSize=18, spaceAfter=4)
     body= styles["BodyText"]
@@ -2966,21 +2987,20 @@ async def fleet_report_pdf(request: Request, from_date: str = "", to_date: str =
         ("BACKGROUND",(0,0),(-1,0), amber),
         ("TEXTCOLOR",(0,0),(-1,0), colors.white),
         ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
-        ("BACKGROUND",(0,-1),(-1,-1), colors.HexColor("#FFFBEB")),
+        ("BACKGROUND",(0,-1),(-1,-1), colors.HexColor(_C_AMBER_XL)),
         ("FONTNAME",(0,-1),(-1,-1),"Helvetica-Bold"),
         ("TEXTCOLOR",(0,-1),(-2,-1), dark),
         ("TEXTCOLOR",(-1,-1),(-1,-1), green),
         ("FONTSIZE",(0,0),(-1,-1),8),
         ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
-        ("ROWBACKGROUNDS",(0,1),(-1,-2),[colors.white, colors.HexColor("#FFFBEB")]),
-        ("GRID",(0,0),(-1,-1),0.4,colors.HexColor("#D1D5DB")),
+        ("ROWBACKGROUNDS",(0,1),(-1,-2),[colors.white, colors.HexColor(_C_AMBER_XL)]),
+        ("GRID",(0,0),(-1,-1),0.4,colors.HexColor(_C_GRID)),
         ("LINEABOVE",(0,-1),(-1,-1),1.5,amber),
     ]))
     story.append(tbl)
-    doc.build(story); buf.seek(0)
+    doc.build(story)
     label = f"{from_date or 'all'}_to_{to_date or 'all'}"
-    return StreamingResponse(buf, media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=fleet_report_{label}.pdf"})
+    return _pdf_response(buf, f"fleet_report_{label}.pdf")
 
 @app.post("/api/admin/delete-all")
 async def admin_delete_all(request: Request):
@@ -3426,10 +3446,9 @@ async def report_csv(request: Request, from_date: str = "", to_date: str = ""):
 
 @app.get("/api/report-pdf")
 async def report_pdf(request: Request, from_date: str = "", to_date: str = ""):
-    from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle, HRFlowable
     from reportlab.lib import colors
 
     did      = _auth(request)
@@ -3455,14 +3474,12 @@ async def report_pdf(request: Request, from_date: str = "", to_date: str = ""):
     all_dates = sorted(set(pickup_map) | set(expense_map))
 
     buf  = io.BytesIO()
-    doc  = SimpleDocTemplate(buf, pagesize=letter,
-                             leftMargin=0.75*inch, rightMargin=0.75*inch,
-                             topMargin=0.75*inch,  bottomMargin=0.75*inch)
+    doc  = _pdf_doc(buf, 0.75)
     styles = getSampleStyleSheet()
-    amber  = colors.HexColor("#D97706")
-    dark   = colors.HexColor("#1C1917")
-    red    = colors.HexColor("#EF4444")
-    green  = colors.HexColor("#10B981")
+    amber  = colors.HexColor(_C_AMBER)
+    dark   = colors.HexColor(_C_DARK)
+    red    = colors.HexColor(_C_RED)
+    green  = colors.HexColor(_C_GREEN)
     h1  = ParagraphStyle("h1",  parent=styles["Heading1"], textColor=amber, fontSize=18, spaceAfter=2)
     h2  = ParagraphStyle("h2",  parent=styles["Heading2"], textColor=dark,  fontSize=12, spaceBefore=10, spaceAfter=4)
     h3  = ParagraphStyle("h3",  parent=styles["Heading3"], textColor=dark,  fontSize=10, spaceBefore=6,  spaceAfter=2)
@@ -3484,8 +3501,8 @@ async def report_pdf(request: Request, from_date: str = "", to_date: str = ""):
         ("FONTSIZE",   (0,0), (-1,-1), 7),
         ("TOPPADDING", (0,0), (-1,-1), 3),
         ("BOTTOMPADDING", (0,0), (-1,-1), 3),
-        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#FFFBEB")]),
-        ("GRID", (0,0), (-1,-1), 0.4, colors.HexColor("#D1D5DB")),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor(_C_AMBER_XL)]),
+        ("GRID", (0,0), (-1,-1), 0.4, colors.HexColor(_C_GRID)),
     ]
 
     grand_totals = {"meter":0,"tip_cash":0,"tip_credit":0,"tip_voucher":0,"gross":0,"expenses":0,"owed":0,"net":0,"earnings":0,"count":0}
@@ -3561,17 +3578,16 @@ async def report_pdf(request: Request, from_date: str = "", to_date: str = ""):
     st.setStyle(TableStyle([
         ("FONTSIZE",(0,0),(-1,-1),9),
         ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
-        ("ROWBACKGROUNDS",(0,0),(-1,-1),[colors.white, colors.HexColor("#FFFBEB")]),
-        ("GRID",(0,0),(-1,-1),0.5,colors.HexColor("#D1D5DB")),
+        ("ROWBACKGROUNDS",(0,0),(-1,-1),[colors.white, colors.HexColor(_C_AMBER_XL)]),
+        ("GRID",(0,0),(-1,-1),0.5,colors.HexColor(_C_GRID)),
         ("FONTNAME",(0,-1),(-1,-1),"Helvetica-Bold"),
         ("TEXTCOLOR",(0,-1),(-1,-1),green),
     ]))
     story.append(st)
 
-    doc.build(story); buf.seek(0)
+    doc.build(story)
     label = f"{from_date or 'all'}_to_{to_date or 'all'}"
-    return StreamingResponse(buf, media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=earnings_report_{label}.pdf"})
+    return _pdf_response(buf, f"earnings_report_{label}.pdf")
 
 # ── customers ────────────────────────────────────────────────────
 
@@ -3683,16 +3699,15 @@ for _name, (_path, _expect_list) in _BACKUP_FILES.items():
 
 @app.get("/api/requirements-pdf")
 async def requirements_pdf(request: Request):
-    from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle, HRFlowable
     from reportlab.lib import colors
     did = _auth(request)
     profile = _read_profile(did); driver = profile.get("driver_name", "Unknown Driver")
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=letter, leftMargin=inch, rightMargin=inch, topMargin=inch, bottomMargin=inch)
-    styles = getSampleStyleSheet(); amber = colors.HexColor("#D97706"); dark = colors.HexColor("#1C1917")
+    doc = _pdf_doc(buf, 1.0)
+    styles = getSampleStyleSheet(); amber = colors.HexColor(_C_AMBER); dark = colors.HexColor(_C_DARK)
     h1 = ParagraphStyle("h1", parent=styles["Heading1"], textColor=amber, fontSize=18, spaceAfter=4)
     h2 = ParagraphStyle("h2", parent=styles["Heading2"], textColor=dark,  fontSize=13, spaceBefore=12, spaceAfter=4)
     body = styles["BodyText"]
@@ -3708,26 +3723,24 @@ async def requirements_pdf(request: Request):
     tbl = Table(td, colWidths=[1.5*inch, 1.5*inch, 3.5*inch])
     tbl.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),amber),("TEXTCOLOR",(0,0),(-1,0),colors.white),
         ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#FEF3C7")]),
-        ("GRID",(0,0),(-1,-1),0.5,colors.HexColor("#D1D5DB")),("FONTSIZE",(0,0),(-1,-1),9),
+        ("GRID",(0,0),(-1,-1),0.5,colors.HexColor(_C_GRID)),("FONTSIZE",(0,0),(-1,-1),9),
         ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4)]))
     story += [tbl, Spacer(1,6), Paragraph("3. Payment Modes", h2),
               Paragraph("<b>Standard:</b> ((Credit + Voucher) − Cash) / 2 + Credit Tips + Voucher Tips", body),
               Paragraph("<b>Gate:</b> Grand Total − Daily Gate Fee", body),
               Paragraph("<b>Commission:</b> Meter Total × Driver% + All Tips", body),
               Paragraph("<b>Owner-Operator:</b> Grand Total (keep everything)", body)]
-    doc.build(story); buf.seek(0)
-    return StreamingResponse(buf, media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=requirements_{date.today().isoformat()}.pdf"})
+    doc.build(story)
+    return _pdf_response(buf, f"requirements_{date.today().isoformat()}.pdf")
 
 # ── admin design document PDF ────────────────────────────────────
 
 @app.get("/api/admin/design-pdf")
 async def admin_design_pdf(request: Request):
     _require_admin(request)
-    from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, PageBreak
+    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle, HRFlowable, PageBreak
     from reportlab.lib import colors
 
     W = 6.5 * inch  # usable width
@@ -3739,9 +3752,7 @@ async def admin_design_pdf(request: Request):
     gray   = colors.HexColor("#6B6660")
 
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=letter,
-                            leftMargin=0.85*inch, rightMargin=0.85*inch,
-                            topMargin=0.85*inch, bottomMargin=0.85*inch)
+    doc = _pdf_doc(buf, 0.85)
     styles = getSampleStyleSheet()
 
     h1     = ParagraphStyle("h1",     parent=styles["Heading1"], textColor=blue,  fontSize=20, spaceAfter=2, leading=24)
@@ -4358,10 +4369,7 @@ async def admin_design_pdf(request: Request):
     ]
 
     doc.build(story)
-    buf.seek(0)
-    fname = f"taxilog_design_{date.today().isoformat()}.pdf"
-    return StreamingResponse(buf, media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename={fname}"})
+    return _pdf_response(buf, f"taxilog_design_{date.today().isoformat()}.pdf")
 
 # ── entry point ──────────────────────────────────────────────────
 
