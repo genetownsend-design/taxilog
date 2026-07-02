@@ -6,3 +6,5 @@ templates/
 *.pdf
 .vscode/
 .claude/
+backups/
+baseline/
