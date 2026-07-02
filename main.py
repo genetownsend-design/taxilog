@@ -1,3 +1,46 @@
+# ════════════════════════════════════════════════════════════════
+# TAXI PICKUP DAILY LOG — single-file FastAPI app
+#
+# TABLE OF CONTENTS — search for the banner text to jump there:
+#
+#   paths                   base dirs and data-file constants
+#   HTML TEMPLATES          templates/base.html · index.html · setup.html ·
+#                           login.html · register.html · admin_register.html ·
+#                           admin_reset.html · reset_password.html · admin.html
+#   CSS                     static/css/style.css
+#   JAVASCRIPT              static/js/app.js
+#   WRITE ASSETS TO DISK    the constants above are (re)written to templates/
+#                           and static/ on every startup — edit them HERE,
+#                           never the generated files
+#   HELPERS
+#     config (env vars)       GCS_BUCKET · SECRET_KEY · ADMIN_SECRET · …
+#     auth context            AuthCtx · password hashing
+#     storage primitives      _read/_write (GCS or local) — sole I/O layer
+#     users                   _read_users/_write_users (root, un-namespaced)
+#     session helpers         signed cookies txl_sess / txl_view
+#     data migration          flat → driver-namespaced (first registration)
+#     business logic          owed_driver_amount · day_totals · calc_total ·
+#                             upsert_customer
+#   APP + ROUTES
+#     auth routes             /login /register /logout /reset-password …
+#     admin routes            /admin /admin/view /admin/deactivate …
+#     fleet report APIs       /api/admin/fleet-report[-pdf] · fleet backup/restore
+#     pages                   / /setup
+#     pickups                 /api/pickups CRUD
+#     expenses                /api/expenses
+#     shifts                  /api/shifts
+#     daily totals            /api/daily-totals
+#     report                  /api/report
+#     Ask (AI analysis)       /api/ask
+#     CSV export              /api/report/csv
+#     PDF report              /api/report-pdf
+#     customers               /api/customers/suggest /api/customers/lookup
+#     backup / restore        /api/backup/* /api/restore/*
+#     requirements PDF        /api/requirements-pdf
+#     admin design document   /api/admin/design-pdf
+#     entry point             uvicorn
+# ════════════════════════════════════════════════════════════════
+
 import uuid
 import json
 import csv
@@ -35,6 +78,7 @@ DATA_DIR.mkdir(exist_ok=True)
 # HTML TEMPLATES
 # ════════════════════════════════════════════════════════════════
 
+# ── templates/base.html — shared layout, nav, modals ───────────
 BASE_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -285,6 +329,7 @@ BASE_HTML = """<!DOCTYPE html>
 </html>
 """
 
+# ── templates/index.html — daily log page ──────────────────────
 INDEX_HTML = """{% extends "base.html" %}
 {% block title %}Daily Log – Taxi Log{% endblock %}
 {% block content %}
@@ -442,6 +487,7 @@ INDEX_HTML = """{% extends "base.html" %}
 {% endblock %}
 """
 
+# ── templates/setup.html — profile & password ──────────────────
 SETUP_HTML = """{% extends "base.html" %}
 {% block title %}Setup – Taxi Log{% endblock %}
 {% block content %}
@@ -556,6 +602,7 @@ function showMsg(el,text,bg,color){el.style.display='';el.style.background=bg;el
 {% endblock %}
 """
 
+# ── templates/login.html ───────────────────────────────────────
 LOGIN_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -594,6 +641,7 @@ LOGIN_HTML = """<!DOCTYPE html>
 </html>
 """
 
+# ── templates/register.html ────────────────────────────────────
 REGISTER_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -634,6 +682,7 @@ REGISTER_HTML = """<!DOCTYPE html>
 </html>
 """
 
+# ── templates/admin_register.html ──────────────────────────────
 ADMIN_REGISTER_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -679,6 +728,7 @@ ADMIN_REGISTER_HTML = """<!DOCTYPE html>
 </html>
 """
 
+# ── templates/admin_reset.html ─────────────────────────────────
 ADMIN_RESET_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -726,6 +776,7 @@ ADMIN_RESET_HTML = """<!DOCTYPE html>
 </html>
 """
 
+# ── templates/reset_password.html ──────────────────────────────
 RESET_PASSWORD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -766,6 +817,7 @@ RESET_PASSWORD_HTML = """<!DOCTYPE html>
 </html>
 """
 
+# ── templates/admin.html — admin dashboard ─────────────────────
 ADMIN_HTML = """{% extends "base.html" %}
 {% block title %}Admin Dashboard – Taxi Log{% endblock %}
 {% block content %}
@@ -1129,6 +1181,7 @@ async function restoreFleetBackup(){
 # CSS
 # ════════════════════════════════════════════════════════════════
 
+# ── static/css/style.css ───────────────────────────────────────
 CSS = """\
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -1358,6 +1411,7 @@ select.field-input{cursor:pointer}
 # JAVASCRIPT
 # ════════════════════════════════════════════════════════════════
 
+# ── static/js/app.js ───────────────────────────────────────────
 JS = """/* app.js */
 (function(){
   const _f=window.fetch;
@@ -2188,7 +2242,10 @@ async function restoreFile(type){
 }
 """
 
-# ── write assets to disk (always refresh) ───────────────────────
+# ════════════════════════════════════════════════════════════════
+# WRITE ASSETS TO DISK — regenerated on every startup (always refresh)
+# ════════════════════════════════════════════════════════════════
+
 _ASSETS = {
     "templates/base.html":          BASE_HTML,
     "templates/index.html":         INDEX_HTML,
@@ -2211,6 +2268,7 @@ for _rel, _content in _ASSETS.items():
 # HELPERS
 # ════════════════════════════════════════════════════════════════
 
+# ── config (env vars) ────────────────────────────────────────────
 _GCS_BUCKET       = os.environ.get("GCS_BUCKET")
 _SECRET_KEY       = os.environ.get("SECRET_KEY", "dev-only-insecure-key")
 _ADMIN_SECRET     = os.environ.get("ADMIN_SECRET", "")
@@ -2222,6 +2280,7 @@ _VIEW_MAX     = 3600 * 4     # 4-hour impersonation window
 _RESET_MAX    = 3600         # 1-hour reset tokens
 _reset_tokens: dict[str, str] = {}  # token → user_id
 
+# ── auth context & password hashing ──────────────────────────────
 @dataclass
 class AuthCtx:
     user_id: str
@@ -2236,6 +2295,7 @@ def _hash_pw(password: str) -> str:
 def _check_pw(password: str, hashed: str) -> bool:
     return _bcrypt_lib.checkpw(password.encode(), hashed.encode())
 
+# ── storage primitives (GCS or local filesystem) ─────────────────
 def _gcs_client():
     from google.cloud import storage
     return storage.Client()
@@ -2376,6 +2436,7 @@ def _migrate_flat_data(driver_id: str):
             if old.exists() and not new.exists():
                 old.rename(new)
 
+# ── business logic (earnings math, customers) ────────────────────
 def owed_driver_amount(t: dict, profile: dict) -> float:
     mode = (profile or {}).get("pay_mode", "standard")
     mc, mcr, mv = t["meter_cash"], t["meter_credit"], t["meter_voucher"]
@@ -2436,7 +2497,7 @@ def upsert_customer(name, address, city, phone, driver_id: str = ""):
     _write(CUSTOMERS_F, customers, driver_id)
 
 # ════════════════════════════════════════════════════════════════
-# APP
+# APP + ROUTES
 # ════════════════════════════════════════════════════════════════
 
 TEMPLATES_DIR = (BASE_DIR / "templates").resolve()
@@ -3647,7 +3708,7 @@ async def restore_all(request: Request, file: UploadFile = File(...)):
         raise HTTPException(400, "Invalid JSON in backup file")
     return {"ok": True, "restored": restored}
 
-# ── requirements PDF (unchanged) ─────────────────────────────────
+# ── requirements PDF ─────────────────────────────────────────────
 
 @app.get("/api/requirements-pdf")
 async def requirements_pdf(request: Request):
