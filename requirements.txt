@@ -8,3 +8,4 @@ google-cloud-storage
 itsdangerous
 bcrypt
 anthropic
+python-dotenv

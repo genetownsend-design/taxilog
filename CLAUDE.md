@@ -21,9 +21,16 @@ pip install -r requirements.txt
 python main.py
 ```
 
-The app starts on port 8080 by default. No database setup needed — data files are created automatically on first run under `data/`.
+The app starts on port 8080 by default. No database setup needed — data files are created automatically on first run under `data/`. For local dev, env vars can be put in a `.env` file (loaded via python-dotenv).
 
-There are no tests and no linter configuration.
+Tests cover the Shift Debrief feature only (stats math, period resolution, caching, and the `ask_claude` helper — the Anthropic client is mocked, no network):
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/
+```
+
+There is no linter configuration and no coverage gate.
 
 ## Deployment
 
@@ -61,6 +68,7 @@ Each driver is identified by a UUID (`driver_id`). Data files are:
 - `expenses.json` — daily expenses
 - `shifts.json` — shift logs with odometer and hours
 - `profile.json` — driver profile (name, vehicle, gate fee rate, etc.)
+- `debriefs.json` — cached AI shift debriefs, keyed by `period:start:end` with a sha256 hash of the range's pickups for invalidation
 
 ### Auth
 
@@ -87,4 +95,4 @@ Since templates and static files are string constants in `main.py`, edit them th
 | `SECRET_KEY` | Yes | Signs session cookies (defaults to insecure dev key) |
 | `ADMIN_SECRET` | Yes | Required to access `/admin/register` to create admin accounts |
 | `GOOGLE_MAPS_KEY` | No | Google Maps Embed API key — enables inline map overlay in pickup cards; if absent, Map button opens Google Maps in a new tab |
-| `ANTHROPIC_API_KEY` | No | Enables the "Ask About Your Data" AI panel; if absent, panel is hidden |
+| `ANTHROPIC_API_KEY` | No | Enables the "Ask About Your Data" AI panel and the Shift Debrief page (`/debrief`); if absent, the panel is hidden and the debrief page shows a not-configured message. Both features call the API through the shared `ask_claude()` helper (model: `_CLAUDE_MODEL` constant) |

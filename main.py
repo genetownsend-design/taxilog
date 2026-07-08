@@ -4,9 +4,10 @@
 # TABLE OF CONTENTS — search for the banner text to jump there:
 #
 #   paths                   base dirs and data-file constants
-#   HTML TEMPLATES          templates/base.html · index.html · setup.html ·
-#                           login.html · register.html · admin_register.html ·
-#                           admin_reset.html · reset_password.html · admin.html
+#   HTML TEMPLATES          templates/base.html · index.html · debrief.html ·
+#                           setup.html · login.html · register.html ·
+#                           admin_register.html · admin_reset.html ·
+#                           reset_password.html · admin.html
 #   CSS                     static/css/style.css
 #   JAVASCRIPT              static/js/app.js
 #   WRITE ASSETS TO DISK    the constants above are (re)written to templates/
@@ -14,6 +15,7 @@
 #                           never the generated files
 #   HELPERS
 #     config (env vars)       GCS_BUCKET · SECRET_KEY · ADMIN_SECRET · …
+#     Claude API              _CLAUDE_MODEL · ask_claude (shared AI helper)
 #     auth context            AuthCtx · password hashing
 #     storage primitives      _read/_write (GCS or local) — sole I/O layer
 #     users                   _read_users/_write_users (root, un-namespaced)
@@ -25,13 +27,14 @@
 #     auth routes             /login /register /logout /reset-password …
 #     admin routes            /admin /admin/view /admin/deactivate …
 #     fleet report APIs       /api/admin/fleet-report[-pdf] · fleet backup/restore
-#     pages                   / /setup
+#     pages                   / /setup /debrief
 #     pickups                 /api/pickups CRUD
 #     expenses                /api/expenses
 #     shifts                  /api/shifts
 #     daily totals            /api/daily-totals
 #     report                  /api/report
 #     Ask (AI analysis)       /api/ask
+#     Shift Debrief           /debrief · /api/debrief (AI period analysis)
 #     CSV export              /api/report/csv
 #     PDF report              /api/report-pdf
 #     customers               /api/customers/suggest /api/customers/lookup
@@ -46,9 +49,10 @@ import json
 import csv
 import io
 import os
+import hashlib
 from urllib.parse import quote
 from dataclasses import dataclass
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional
 from pathlib import Path
 
@@ -68,6 +72,7 @@ CUSTOMERS_F = DATA_DIR / "customers.json"
 PROFILE_F   = DATA_DIR / "profile.json"
 EXPENSES_F  = DATA_DIR / "expenses.json"
 SHIFTS_F    = DATA_DIR / "shifts.json"
+DEBRIEFS_F  = DATA_DIR / "debriefs.json"
 
 DATA_DIR.mkdir(exist_ok=True)
 (BASE_DIR / "static" / "css").mkdir(parents=True, exist_ok=True)
@@ -128,6 +133,7 @@ BASE_HTML = """<!DOCTYPE html>
     <a href="#" class="nav-link" onclick="closeNav();openExpenseModal()">💸 Expenses</a>
     <a href="#" class="nav-link" onclick="closeNav();openModal('reportModal')">📊 Report</a>
     <a href="#" class="nav-link" onclick="closeNav();openModal('backupModal')">💾 Backup</a>
+    <a href="/debrief" class="nav-link {% if request.url.path == '/debrief' %}active{% endif %}" onclick="closeNav()">🧠 Debrief</a>
     {% if not is_impersonating %}
     <a href="/setup" class="nav-link {% if request.url.path == '/setup' %}active{% endif %}" onclick="closeNav()">⚙️ Setup</a>
     {% endif %}
@@ -484,6 +490,55 @@ INDEX_HTML = """{% extends "base.html" %}
   })();
   loadDailyLog();
 </script>
+{% endblock %}
+"""
+
+# ── templates/debrief.html — AI shift debrief ──────────────────
+DEBRIEF_HTML = """{% extends "base.html" %}
+{% block title %}Debrief – Taxi Log{% endblock %}
+{% block content %}
+<div class="debrief-page">
+  <section class="panel">
+    <div class="panel-header">
+      <div class="panel-title">🧠 Shift Debrief</div>
+    </div>
+    <div class="panel-body">
+      {% if not ask_enabled %}
+      <p class="empty-msg">AI analysis is not configured. Set ANTHROPIC_API_KEY to enable debriefs.</p>
+      {% else %}
+      <div class="debrief-periods">
+        <button type="button" class="period-btn active" data-period="day" onclick="setPeriod(this)">Today</button>
+        <button type="button" class="period-btn" data-period="week" onclick="setPeriod(this)">This Week</button>
+        <button type="button" class="period-btn" data-period="month" onclick="setPeriod(this)">This Month</button>
+        <button type="button" class="period-btn" data-period="custom" onclick="setPeriod(this)">Custom</button>
+      </div>
+      <div class="row-2" id="debriefCustom" style="display:none;margin-bottom:12px">
+        <div class="field-group">
+          <label class="field-label">From</label>
+          <input type="date" id="debriefStart" class="field-input">
+        </div>
+        <div class="field-group">
+          <label class="field-label">To</label>
+          <input type="date" id="debriefEnd" class="field-input" value="{{ today }}">
+        </div>
+      </div>
+      <button class="btn btn-primary btn-full" id="debriefGo" onclick="generateDebrief(0)">Generate Debrief</button>
+      <div id="debriefLoading" style="display:none;text-align:center;padding:24px 0">
+        <span class="spinner"></span>
+        <div class="debrief-loading-msg">Analyzing your shifts…</div>
+      </div>
+      <div id="debriefResult" style="display:none;margin-top:16px">
+        <div class="debrief-md" id="debriefText"></div>
+        <div class="debrief-footer">
+          <span id="debriefMeta"></span>
+          <span class="cached-badge" id="debriefCached" style="display:none">cached</span>
+          <button type="button" class="btn btn-ghost btn-sm" id="debriefRegen" style="display:none" onclick="generateDebrief(1)">↻ Regenerate</button>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+  </section>
+</div>
 {% endblock %}
 """
 
@@ -1405,6 +1460,19 @@ select.field-input{cursor:pointer}
 #clk-hint{text-align:center;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;font-weight:600;margin-bottom:12px}
 #clk-cancel{width:100%;padding:8px;border:1.5px solid var(--border);border-radius:var(--radius-sm);background:#fff;cursor:pointer;font-size:13px;color:var(--text2);font-family:var(--font);transition:background .15s}
 #clk-cancel:hover{background:var(--surface2)}
+.debrief-page{max-width:720px;margin:0 auto}
+.debrief-periods{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.period-btn{flex:1;min-width:96px;padding:9px 10px;border:1.5px solid var(--border2);border-radius:var(--radius-sm);background:#fff;font-size:13px;font-weight:600;color:var(--text2);cursor:pointer;font-family:var(--font);transition:all .15s}
+.period-btn.active{background:var(--amber);border-color:var(--amber);color:#00274C}
+.spinner{display:inline-block;width:28px;height:28px;border:3px solid var(--amber-lt);border-top-color:var(--amber-d);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.debrief-loading-msg{margin-top:10px;font-size:13px;color:var(--text3)}
+.debrief-md{border-top:1px solid var(--border);padding-top:14px;font-size:14px;line-height:1.7;color:var(--text)}
+.debrief-md h3,.debrief-md h4,.debrief-md h5{margin:14px 0 6px;color:var(--text)}
+.debrief-md ul{margin:6px 0;padding-left:20px}
+.debrief-md p{margin:8px 0}
+.debrief-footer{display:flex;align-items:center;gap:10px;margin-top:14px;padding-top:10px;border-top:1px solid var(--border);font-size:11.5px;color:var(--text3);flex-wrap:wrap}
+.cached-badge{background:var(--amber-lt);color:#92400E;font-size:10.5px;font-weight:700;padding:2px 8px;border-radius:20px;text-transform:uppercase;letter-spacing:.05em}
 """
 
 # ════════════════════════════════════════════════════════════════
@@ -1954,6 +2022,78 @@ function clearAsk(){
   document.getElementById('askAnswer').textContent='';
 }
 
+/* --- Debrief page --- */
+let debriefPeriod='day';
+function setPeriod(btn){
+  debriefPeriod=btn.dataset.period;
+  document.querySelectorAll('.period-btn').forEach(b=>b.classList.toggle('active',b===btn));
+  document.getElementById('debriefCustom').style.display=debriefPeriod==='custom'?'grid':'none';
+}
+function escapeHtml(s){
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+/* minimal markdown: headings, **bold**, *italic*, - lists, paragraphs.
+   Input is fully HTML-escaped first, so innerHTML is safe. */
+function renderMarkdown(text){
+  const lines=escapeHtml(text).split('\\n');
+  const inline=s=>s.replace(/\\*\\*(.+?)\\*\\*/g,'<strong>$1</strong>').replace(/\\*(.+?)\\*/g,'<em>$1</em>');
+  let html='',inList=false,para=[];
+  const flush=()=>{if(para.length){html+='<p>'+para.join('<br>')+'</p>';para=[];}};
+  for(const raw of lines){
+    const line=raw.trim();
+    if(line.startsWith('- ')||line.startsWith('* ')){
+      flush();
+      if(!inList){html+='<ul>';inList=true;}
+      html+='<li>'+inline(line.slice(2))+'</li>';
+      continue;
+    }
+    if(inList){html+='</ul>';inList=false;}
+    if(line.startsWith('#')){
+      flush();
+      const level=Math.min(line.match(/^#+/)[0].length+2,5);
+      html+='<h'+level+'>'+inline(line.replace(/^#+\\s*/,''))+'</h'+level+'>';
+    }else if(line===''){flush();}
+    else para.push(inline(line));
+  }
+  if(inList)html+='</ul>';
+  flush();
+  return html;
+}
+async function generateDebrief(force){
+  const loading=document.getElementById('debriefLoading');
+  const result=document.getElementById('debriefResult');
+  const go=document.getElementById('debriefGo');
+  let url='/api/debrief?period='+debriefPeriod+'&force='+force;
+  if(debriefPeriod==='custom'){
+    const s=document.getElementById('debriefStart').value;
+    const e=document.getElementById('debriefEnd').value;
+    if(!s||!e){showToast('Pick both start and end dates');return;}
+    url+='&start='+s+'&end='+e;
+  }
+  loading.style.display='block';result.style.display='none';go.disabled=true;
+  const text=document.getElementById('debriefText');
+  const meta=document.getElementById('debriefMeta');
+  const badge=document.getElementById('debriefCached');
+  const regen=document.getElementById('debriefRegen');
+  try{
+    const r=await fetch(url);
+    const d=await r.json();
+    loading.style.display='none';go.disabled=false;result.style.display='block';
+    badge.style.display='none';regen.style.display='none';meta.textContent='';
+    if(!r.ok){text.textContent=d.detail||'Request failed.';return;}
+    if(d.error){text.textContent=d.error;return;}
+    if(d.empty){text.textContent=d.message;meta.textContent=d.start+' → '+d.end;return;}
+    text.innerHTML=renderMarkdown(d.debrief);
+    meta.textContent=d.start+' → '+d.end+' · '+d.model+' · generated '+d.generated_at.slice(0,16).replace('T',' ')+' UTC';
+    badge.style.display=d.cached?'inline-block':'none';
+    regen.style.display=d.cached?'inline-block':'none';
+  }catch(err){
+    loading.style.display='none';go.disabled=false;result.style.display='block';
+    badge.style.display='none';regen.style.display='none';meta.textContent='';
+    text.textContent='Network error — could not reach the server.';
+  }
+}
+
 /* --- Expense Modal --- */
 function openExpenseModal(){
   const d=document.getElementById('logDate');
@@ -2250,6 +2390,7 @@ _ASSETS = {
     "templates/base.html":          BASE_HTML,
     "templates/index.html":         INDEX_HTML,
     "templates/setup.html":         SETUP_HTML,
+    "templates/debrief.html":       DEBRIEF_HTML,
     "templates/login.html":         LOGIN_HTML,
     "templates/register.html":      REGISTER_HTML,
     "templates/admin.html":         ADMIN_HTML,
@@ -2269,6 +2410,9 @@ for _rel, _content in _ASSETS.items():
 # ════════════════════════════════════════════════════════════════
 
 # ── config (env vars) ────────────────────────────────────────────
+from dotenv import load_dotenv
+load_dotenv()  # local dev: read a .env file if present (no-op in prod)
+
 _GCS_BUCKET       = os.environ.get("GCS_BUCKET")
 _SECRET_KEY       = os.environ.get("SECRET_KEY", "dev-only-insecure-key")
 _ADMIN_SECRET     = os.environ.get("ADMIN_SECRET", "")
@@ -2279,6 +2423,51 @@ _SESSION_MAX  = 86400 * 30   # 30-day sessions
 _VIEW_MAX     = 3600 * 4     # 4-hour impersonation window
 _RESET_MAX    = 3600         # 1-hour reset tokens
 _reset_tokens: dict[str, str] = {}  # token → user_id
+
+# ── Claude API (shared by /api/ask and /api/debrief) ─────────────
+_CLAUDE_MODEL = "claude-sonnet-4-6"
+
+class AskClaudeError(Exception):
+    """Claude API call failed; str(exc) is a user-facing message."""
+
+def ask_claude(system: str, user_content: str, max_tokens: int = 1500) -> str:
+    if not _ANTHROPIC_KEY:
+        raise AskClaudeError("AI analysis not configured.")
+    import anthropic as _anthropic
+    print(f"[claude] {datetime.utcnow().isoformat()} model={_CLAUDE_MODEL} "
+          f"input_chars={len(system) + len(user_content)} max_tokens={max_tokens}", flush=True)
+    client = _anthropic.Anthropic(api_key=_ANTHROPIC_KEY, timeout=60.0)
+    try:
+        msg = client.messages.create(
+            model=_CLAUDE_MODEL,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": user_content}],
+            system=system,
+        )
+    except _anthropic.AuthenticationError:
+        raise AskClaudeError("AI request failed: the API key was rejected. Check ANTHROPIC_API_KEY.")
+    except _anthropic.PermissionDeniedError:
+        raise AskClaudeError("AI request failed: the API key lacks permission for this model.")
+    except _anthropic.NotFoundError:
+        raise AskClaudeError(f"AI request failed: model '{_CLAUDE_MODEL}' was not found.")
+    except _anthropic.RateLimitError as e:
+        retry = e.response.headers.get("retry-after") if getattr(e, "response", None) is not None else None
+        raise AskClaudeError("AI request failed: rate limit reached. "
+                             + (f"Try again in {retry} seconds." if retry else "Try again shortly."))
+    except _anthropic.APITimeoutError:
+        raise AskClaudeError("AI request timed out after 60 seconds. Try again.")
+    except _anthropic.APIConnectionError:
+        raise AskClaudeError("AI request failed: could not reach the Anthropic API. Check your connection.")
+    except _anthropic.APIStatusError as e:
+        if e.status_code >= 500:
+            raise AskClaudeError(f"AI request failed: Anthropic service error ({e.status_code}). Try again shortly.")
+        raise AskClaudeError(f"AI request failed: API error {e.status_code}.")
+    if msg.stop_reason == "refusal" or not msg.content:
+        raise AskClaudeError("The AI declined to answer this request.")
+    text = msg.content[0].text
+    if msg.stop_reason == "max_tokens":
+        text += "\n\n(Response cut off — answer exceeded token limit.)"
+    return text
 
 # ── auth context & password hashing ──────────────────────────────
 @dataclass
@@ -3403,20 +3592,206 @@ Shift records ({len(shifts_all)}): {json.dumps(shifts_all)}
 Be concise and precise. If the data is insufficient to answer, say so."""
 
     try:
-        import anthropic as _anthropic
-        client = _anthropic.Anthropic(api_key=_ANTHROPIC_KEY)
-        msg = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=8192,
-            messages=[{"role": "user", "content": question}],
-            system=system,
-        )
-        text = msg.content[0].text
-        if msg.stop_reason == "max_tokens":
-            text += "\n\n(Response cut off — answer exceeded token limit. Try asking a more specific question.)"
-        return {"answer": text}
-    except Exception as e:
+        return {"answer": ask_claude(system, question, max_tokens=8192)}
+    except AskClaudeError as e:
         return {"error": str(e)}
+
+# ── Shift Debrief (AI analysis) ──────────────────────────────────
+
+_DEBRIEF_SYSTEM = ("You are analyzing a taxi driver's shift data. Be direct and honest — no cheerleading, "
+                   "no padding. Structure: (1) headline numbers vs prior period, (2) what worked, "
+                   "(3) what didn't or looks like a leak (slow hours worked, low-value patterns), "
+                   "(4) one specific, actionable suggestion for next period. Under 400 words. "
+                   "All numbers are pre-computed in the provided stats — quote them exactly, "
+                   "never recalculate or estimate.")
+
+def _debrief_range(period: str, start: str, end: str, today: date):
+    # returns ISO (start, end, prior_start, prior_end); prior = equivalent preceding window
+    def _parse(s, label):
+        try:
+            return date.fromisoformat(s)
+        except ValueError:
+            raise HTTPException(400, f"Invalid {label} date '{s}' — expected YYYY-MM-DD.")
+    if period == "day":
+        s, e = today, today
+        ps = pe = today - timedelta(days=1)
+    elif period == "week":
+        s = today - timedelta(days=today.weekday())  # Monday
+        e = today
+        ps, pe = s - timedelta(days=7), s - timedelta(days=1)
+    elif period == "month":
+        s, e = today.replace(day=1), today
+        pe = s - timedelta(days=1)
+        ps = pe.replace(day=1)
+    elif period == "custom":
+        if not start or not end:
+            raise HTTPException(400, "Custom period requires both start and end dates.")
+        s, e = _parse(start, "start"), _parse(end, "end")
+        if s > e:
+            raise HTTPException(400, "Start date is after end date.")
+        span = (e - s).days + 1
+        pe = s - timedelta(days=1)
+        ps = pe - timedelta(days=span - 1)
+    else:
+        raise HTTPException(400, f"Unknown period '{period}' — expected day, week, month, or custom.")
+    return s.isoformat(), e.isoformat(), ps.isoformat(), pe.isoformat()
+
+def _hour_block(pickup_time: str) -> str:
+    # times are stored as HH:MM 24-hr by the current form, but legacy records
+    # may be 12-hr with an AM/PM suffix — accept both
+    t = str(pickup_time).strip().upper()
+    try:
+        hour = int(t.split(":")[0])
+    except (ValueError, IndexError):
+        return "unknown"
+    if t.endswith("PM") and hour != 12: hour += 12
+    elif t.endswith("AM") and hour == 12: hour = 0
+    if not 0 <= hour <= 23: return "unknown"
+    if  5 <= hour <= 11: return "morning"
+    if 12 <= hour <= 16: return "afternoon"
+    if 17 <= hour <= 21: return "evening"
+    return "night"
+
+def _owed_driver_period(pickups, profile) -> float:
+    # gate mode charges the fee once per day worked, so sum per-day owed values
+    # (matches /api/report; identical result for the other pay modes)
+    by_day = {}
+    for p in pickups:
+        by_day.setdefault(p.get("pickup_date", ""), []).append(p)
+    return round(sum(day_totals(recs, profile)["owed_driver"] for recs in by_day.values()), 2)
+
+def _display_name(name) -> str:
+    # "Jane Smith" → "Jane S." — full names never go to the API
+    parts = str(name or "").split()
+    if not parts: return ""
+    return parts[0] + (f" {parts[-1][0]}." if len(parts) > 1 else "")
+
+def _debrief_stats(pickups, prior_pickups, profile) -> dict:
+    revenue = round(sum(float(p.get("calculated_total") or 0) for p in pickups), 2)
+    count   = len(pickups)
+    by_method, by_dow, by_block = {}, {}, {}
+    customers = {}
+    for p in pickups:
+        amt = float(p.get("calculated_total") or 0)
+        method = (p.get("payment_method") or "").strip().lower() or "unknown"
+        try:
+            dow = date.fromisoformat(p.get("pickup_date", "")).strftime("%A")
+        except ValueError:
+            dow = "unknown"
+        block = _hour_block(p.get("pickup_time", ""))
+        for bucket, key in ((by_method, method), (by_dow, dow), (by_block, block)):
+            b = bucket.setdefault(key, {"revenue": 0.0, "count": 0})
+            b["revenue"] += amt
+            b["count"]   += 1
+        name = (p.get("customer_name") or "").strip()
+        if name:
+            c = customers.setdefault(name.lower(), {"name": name, "revenue": 0.0, "count": 0})
+            c["revenue"] += amt
+            c["count"]   += 1
+    for bucket in (by_method, by_dow, by_block):
+        for b in bucket.values():
+            b["revenue"] = round(b["revenue"], 2)
+    def _top(key):
+        return [{"name": _display_name(c["name"]), "revenue": round(c["revenue"], 2), "rides": c["count"]}
+                for c in sorted(customers.values(), key=lambda c: -c[key])[:5]]
+    prior_revenue = round(sum(float(p.get("calculated_total") or 0) for p in prior_pickups), 2)
+    prior_count   = len(prior_pickups)
+    stats = {
+        "total_revenue":  revenue,
+        "pickup_count":   count,
+        "average_fare":   round(revenue / count, 2) if count else 0.0,
+        "owed_driver":    _owed_driver_period(pickups, profile),
+        "pay_mode":       (profile or {}).get("pay_mode", "standard"),
+        "by_payment_method": by_method,
+        "by_day_of_week":    by_dow,
+        "by_hour_block":     by_block,
+        "top_customers_by_revenue":   _top("revenue"),
+        "top_customers_by_frequency": _top("count"),
+        "prior_period": None,
+        "vs_prior_pct": None,
+    }
+    if prior_count:
+        prior_avg  = round(prior_revenue / prior_count, 2)
+        prior_owed = _owed_driver_period(prior_pickups, profile)
+        def _pct(cur, prev):
+            return round((cur - prev) / prev * 100, 1) if prev else None
+        stats["prior_period"] = {"total_revenue": prior_revenue, "pickup_count": prior_count,
+                                 "average_fare": prior_avg, "owed_driver": prior_owed}
+        stats["vs_prior_pct"] = {"total_revenue": _pct(revenue, prior_revenue),
+                                 "pickup_count":  _pct(count, prior_count),
+                                 "average_fare":  _pct(stats["average_fare"], prior_avg),
+                                 "owed_driver":   _pct(stats["owed_driver"], prior_owed)}
+    return stats
+
+def _debrief_records(pickups) -> list:
+    # up to the 50 most recent, stripped of PII: no phone, no street or
+    # destination address — first name + last initial and city only
+    recent = sorted(pickups, key=lambda p: (p.get("pickup_date", ""), p.get("pickup_time", "")))[-50:]
+    return [{
+        "customer":       _display_name(p.get("customer_name")),
+        "city":           p.get("city", ""),
+        "date":           p.get("pickup_date", ""),
+        "time":           p.get("pickup_time", ""),
+        "fare":           float(p.get("meter_total") or 0),
+        "tip":            float(p.get("tip") or 0),
+        "payment_method": p.get("payment_method", ""),
+    } for p in recent]
+
+@app.get("/debrief", response_class=HTMLResponse)
+async def debrief_page(request: Request):
+    ctx = _get_auth_ctx(request)
+    if not ctx: return RedirectResponse("/login", status_code=303)
+    return _tmpl("debrief.html", request, {"profile": _read_profile(ctx.effective_id),
+                                           "ask_enabled": bool(_ANTHROPIC_KEY),
+                                           "today": date.today().isoformat(),
+                                           **_ctx_tmpl(ctx)})
+
+@app.get("/api/debrief")
+async def debrief_api(request: Request, period: str = "day", start: str = "", end: str = "", force: int = 0):
+    if not _ANTHROPIC_KEY:
+        raise HTTPException(status_code=503, detail="AI analysis not configured.")
+    ctx = _get_auth_ctx(request)
+    if not ctx: raise HTTPException(401, "Not authenticated")
+    did = ctx.effective_id
+    s, e, ps, pe = _debrief_range(period, start, end, date.today())
+    pickups_all = _read(PICKUPS_F, did)
+    pickups = [p for p in pickups_all if s <= p.get("pickup_date", "") <= e]
+    if not pickups:
+        return {"empty": True, "start": s, "end": e,
+                "message": f"No pickups between {s} and {e} — nothing to debrief."}
+    cache_key    = f"{period}:{s}:{e}"
+    pickups_hash = hashlib.sha256(json.dumps(pickups, sort_keys=True, default=str).encode()).hexdigest()
+    debriefs = _read(DEBRIEFS_F, did)
+    if not isinstance(debriefs, dict): debriefs = {}  # _read returns [] when the file is missing
+    entry = debriefs.get(cache_key)
+    if entry and not force and entry.get("pickups_hash") == pickups_hash:
+        return {"debrief": entry["text"], "model": entry.get("model", _CLAUDE_MODEL),
+                "generated_at": entry["generated_at"], "cached": True, "start": s, "end": e}
+    # generation writes the cache — block impersonating admins here, not on cache reads
+    if ctx.is_impersonating:
+        raise HTTPException(403, "Read-only — viewing another driver's account.")
+    prior   = [p for p in pickups_all if ps <= p.get("pickup_date", "") <= pe]
+    profile = _read_profile(did) or {}
+    stats   = _debrief_stats(pickups, prior, profile)
+    user_content = (f"Period: {s} to {e} (prior period: {ps} to {pe})\n\n"
+                    f"Pre-computed stats (ground truth):\n{json.dumps(stats)}\n\n"
+                    f"Most recent raw pickup records (up to 50, for color only):\n"
+                    f"{json.dumps(_debrief_records(pickups))}")
+    print(f"[debrief] {datetime.utcnow().isoformat()} user={did} period={period} range={s}..{e} "
+          f"pickups={len(pickups)} input_chars={len(user_content)}", flush=True)
+    try:
+        text = ask_claude(_DEBRIEF_SYSTEM, user_content, max_tokens=1500)
+    except AskClaudeError as err:
+        return {"error": str(err), "start": s, "end": e}
+    generated_at = datetime.utcnow().isoformat()
+    debriefs[cache_key] = {"text": text, "model": _CLAUDE_MODEL,
+                           "generated_at": generated_at, "pickups_hash": pickups_hash}
+    if len(debriefs) > 20:  # keep the newest 20 so the file can't grow unbounded
+        for k in sorted(debriefs, key=lambda k: debriefs[k].get("generated_at", ""))[:len(debriefs) - 20]:
+            del debriefs[k]
+    _write(DEBRIEFS_F, debriefs, did)
+    return {"debrief": text, "model": _CLAUDE_MODEL, "generated_at": generated_at,
+            "cached": False, "start": s, "end": e}
 
 # ── CSV export ───────────────────────────────────────────────────
 
