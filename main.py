@@ -487,6 +487,12 @@ INDEX_HTML = """{% extends "base.html" %}
     const d = new Date(); d.setMinutes(d.getMinutes()+20);
     const h24=String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
     document.getElementById('pickup_time').value=to12h(h24);
+    // server "today" is UTC on Cloud Run — override date defaults with browser-local today
+    const pad=n=>String(n).padStart(2,'0');
+    const n=new Date(); // not d: its +20min would roll the date near midnight
+    const local=n.getFullYear()+'-'+pad(n.getMonth()+1)+'-'+pad(n.getDate());
+    document.getElementById('pickup_date').value=local;
+    document.getElementById('logDate').value=local;
   })();
   loadDailyLog();
 </script>
@@ -3542,6 +3548,17 @@ async def report(request: Request, from_date: str = "", to_date: str = ""):
 
 # ── Ask (AI analysis) ────────────────────────────────────────────
 
+def _with_dow(records, date_key):
+    # LLMs are unreliable at deriving weekdays from dates, so precompute
+    out = []
+    for r in records:
+        try:
+            dow = date.fromisoformat(r.get(date_key, "")).strftime("%A")
+        except ValueError:
+            dow = "unknown"
+        out.append({**r, "day_of_week": dow})
+    return out
+
 @app.post("/api/ask")
 async def ask(request: Request):
     if not _ANTHROPIC_KEY:
@@ -3580,15 +3597,16 @@ Pickup record field glossary:
 - calculated_total: total charged (meter + tip)
 - pickup_date: date of pickup (YYYY-MM-DD)
 - pickup_time: time of pickup
+- day_of_week: day of the week for the record's date, precomputed by the app — ALWAYS use this field for any day-of-week question; never derive the weekday from a date yourself
 
 Pre-verified totals for the date range (calculated by the app's canonical day_totals function — treat these as ground truth for aggregate figures):
 {json.dumps(verified_totals)}
 
 Driver profile: {json.dumps(profile)}
 Date range: {date_range}
-Pickup records ({len(pickups)}): {json.dumps(pickups)}
-Expense records ({len(expenses_all)}): {json.dumps(expenses_all)}
-Shift records ({len(shifts_all)}): {json.dumps(shifts_all)}
+Pickup records ({len(pickups)}): {json.dumps(_with_dow(pickups, "pickup_date"))}
+Expense records ({len(expenses_all)}): {json.dumps(_with_dow(expenses_all, "date"))}
+Shift records ({len(shifts_all)}): {json.dumps(_with_dow(shifts_all, "date"))}
 Be concise and precise. If the data is insufficient to answer, say so."""
 
     try:
