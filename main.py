@@ -3589,27 +3589,41 @@ async def ask(request: Request):
     verified_totals = day_totals(pickups, profile)
 
     # LLMs are unreliable at aggregating raw records, so precompute the
-    # per-date and per-weekday rollups and pass them as ground truth
-    daily = {}
+    # per-date and per-weekday rollups and pass them as ground truth.
+    # driver_earned matches the report formula: owed_driver + cash received
+    # - expenses (day_totals applies the gate fee once per day)
+    pickups_by_day, expenses_by_day = {}, {}
     for p in pickups:
-        d = daily.setdefault(p.get("pickup_date", ""), {"rides": 0, "revenue": 0.0})
-        d["rides"]   += 1
-        d["revenue"] += float(p.get("calculated_total") or 0)
+        pickups_by_day.setdefault(p.get("pickup_date", ""), []).append(p)
+    for e in expenses_all:
+        d = e.get("date", "")
+        expenses_by_day[d] = expenses_by_day.get(d, 0.0) + float(e.get("amount") or 0)
+    daily = {}
+    for day_str in sorted(set(pickups_by_day) | set(expenses_by_day)):
+        t   = day_totals(pickups_by_day.get(day_str, []), profile)
+        exp = round(expenses_by_day.get(day_str, 0.0), 2)
+        daily[day_str] = {"rides": t["count"], "revenue": t["grand_total"], "expenses": exp,
+                          "driver_earned": round(t["owed_driver"] + t["meter_cash"] + t["tip_cash"] - exp, 2)}
     by_dow = {}
     for day_str, v in daily.items():
         try:
             dow = date.fromisoformat(day_str).strftime("%A")
         except ValueError:
             dow = "unknown"
-        b = by_dow.setdefault(dow, {"days_worked": 0, "rides": 0, "revenue": 0.0})
-        b["days_worked"] += 1
-        b["rides"]       += v["rides"]
-        b["revenue"]     += v["revenue"]
-    for v in daily.values():
-        v["revenue"] = round(v["revenue"], 2)
+        b = by_dow.setdefault(dow, {"days_worked": 0, "rides": 0, "revenue": 0.0,
+                                    "expenses": 0.0, "driver_earned": 0.0})
+        if v["rides"]:
+            b["days_worked"] += 1
+        b["rides"]         += v["rides"]
+        b["revenue"]       += v["revenue"]
+        b["expenses"]      += v["expenses"]
+        b["driver_earned"] += v["driver_earned"]
     for b in by_dow.values():
-        b["revenue"] = round(b["revenue"], 2)
-        b["avg_revenue_per_day_worked"] = round(b["revenue"] / b["days_worked"], 2)
+        for k in ("revenue", "expenses", "driver_earned"):
+            b[k] = round(b[k], 2)
+        if b["days_worked"]:
+            b["avg_revenue_per_day_worked"]       = round(b["revenue"] / b["days_worked"], 2)
+            b["avg_driver_earned_per_day_worked"] = round(b["driver_earned"] / b["days_worked"], 2)
     system = f"""You are a data analyst for a taxi driver. Answer the driver's question using only the data provided.
 
 Pickup record field glossary:
@@ -3625,8 +3639,9 @@ Pickup record field glossary:
 Pre-verified totals for the date range (calculated by the app's canonical day_totals function — treat these as ground truth for aggregate figures):
 {json.dumps(verified_totals)}
 
-Pre-computed revenue per calendar day (date → rides, revenue): {json.dumps(daily)}
-Pre-computed per-weekday aggregates (days_worked = calendar days with pickups; avg_revenue_per_day_worked = revenue / days_worked): {json.dumps(by_dow)}
+Pre-computed per calendar day (date → rides, revenue, expenses, driver_earned): {json.dumps(daily)}
+Pre-computed per-weekday aggregates (days_worked = calendar days with pickups): {json.dumps(by_dow)}
+driver_earned is what the driver actually took home: money the company owes them + cash they received - expenses. For questions about profit, earnings, or money made, use driver_earned. revenue is gross fares (meter + tip) before the company split and expenses — use it only when the driver asks about fares or revenue explicitly.
 For ANY aggregate question — totals, averages, rankings, comparisons, busiest/most-profitable days — quote the pre-computed figures above exactly. Never sum, count, average, or otherwise recalculate from the raw records; use the raw records only to look up individual rides.
 
 Driver profile: {json.dumps(profile)}
