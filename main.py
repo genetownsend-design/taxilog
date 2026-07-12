@@ -3587,6 +3587,29 @@ async def ask(request: Request):
 
     date_range = f"{from_date or 'all time'} to {to_date or 'all time'}"
     verified_totals = day_totals(pickups, profile)
+
+    # LLMs are unreliable at aggregating raw records, so precompute the
+    # per-date and per-weekday rollups and pass them as ground truth
+    daily = {}
+    for p in pickups:
+        d = daily.setdefault(p.get("pickup_date", ""), {"rides": 0, "revenue": 0.0})
+        d["rides"]   += 1
+        d["revenue"] += float(p.get("calculated_total") or 0)
+    by_dow = {}
+    for day_str, v in daily.items():
+        try:
+            dow = date.fromisoformat(day_str).strftime("%A")
+        except ValueError:
+            dow = "unknown"
+        b = by_dow.setdefault(dow, {"days_worked": 0, "rides": 0, "revenue": 0.0})
+        b["days_worked"] += 1
+        b["rides"]       += v["rides"]
+        b["revenue"]     += v["revenue"]
+    for v in daily.values():
+        v["revenue"] = round(v["revenue"], 2)
+    for b in by_dow.values():
+        b["revenue"] = round(b["revenue"], 2)
+        b["avg_revenue_per_day_worked"] = round(b["revenue"] / b["days_worked"], 2)
     system = f"""You are a data analyst for a taxi driver. Answer the driver's question using only the data provided.
 
 Pickup record field glossary:
@@ -3601,6 +3624,10 @@ Pickup record field glossary:
 
 Pre-verified totals for the date range (calculated by the app's canonical day_totals function — treat these as ground truth for aggregate figures):
 {json.dumps(verified_totals)}
+
+Pre-computed revenue per calendar day (date → rides, revenue): {json.dumps(daily)}
+Pre-computed per-weekday aggregates (days_worked = calendar days with pickups; avg_revenue_per_day_worked = revenue / days_worked): {json.dumps(by_dow)}
+For ANY aggregate question — totals, averages, rankings, comparisons, busiest/most-profitable days — quote the pre-computed figures above exactly. Never sum, count, average, or otherwise recalculate from the raw records; use the raw records only to look up individual rides.
 
 Driver profile: {json.dumps(profile)}
 Date range: {date_range}
