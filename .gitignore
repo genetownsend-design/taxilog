@@ -9,3 +9,4 @@ templates/
 .claude/
 backups/
 baseline/
+migrate_sfo.py
