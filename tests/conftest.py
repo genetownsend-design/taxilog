@@ -81,9 +81,11 @@ def mock_claude(monkeypatch):
         def __init__(self):
             self.calls = []
             self.reply = "**Headline**\n\nSolid day.\n\n- keep evenings\n- drop slow mornings"
-        def __call__(self, system, user_content, max_tokens=1500):
+        def __call__(self, system, user_content, max_tokens=1500,
+                     model=None, output_schema=None, effort=None):
             self.calls.append({"system": system, "user_content": user_content,
-                               "max_tokens": max_tokens})
+                               "max_tokens": max_tokens, "model": model,
+                               "output_schema": output_schema, "effort": effort})
             return self.reply
     rec = Recorder()
     monkeypatch.setattr(main, "ask_claude", rec)

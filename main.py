@@ -341,6 +341,26 @@ INDEX_HTML = """{% extends "base.html" %}
 {% block content %}
 <div class="page-layout">
 
+{% if ask_enabled %}
+  <section class="panel">
+    <div class="panel-header">
+      <div class="panel-title">🎙️ Quick Entry</div>
+    </div>
+    <div class="panel-body">
+      <div class="field-group" style="margin-bottom:12px">
+        <textarea id="quickText" class="field-input" rows="2"
+                  placeholder="Pickup at 125 W. 3rd at 10:00, going to Palo Alto"></textarea>
+        <div class="field-hint">Type it or use your keyboard's dictation button. Fills the form below for review — nothing is saved.</div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn btn-primary" onclick="parseQuickEntry()">Parse</button>
+        <button class="btn btn-ghost" onclick="clearQuickEntry()">Clear</button>
+        <span id="quickStatus" style="font-size:13px;color:var(--text3)"></span>
+      </div>
+    </div>
+  </section>
+{% endif %}
+
   <section class="panel">
     <div class="panel-header">
       <div class="panel-title">➕ New Pickup</div>
@@ -603,6 +623,13 @@ SETUP_HTML = """{% extends "base.html" %}
       </div>
 
       <div id="payModeExplain" class="pay-mode-explain"></div>
+
+      <div class="field-group">
+        <label class="field-label">Common Places &amp; Shorthand</label>
+        <textarea name="places" class="field-input" rows="5"
+                  placeholder="Chope ER = Chope ER, 222 W 39th Ave, San Mateo">{{ profile.places if profile and profile.places else '' }}</textarea>
+        <div class="field-hint">How you say places out loud, and what they should become. One per line. Used by Quick Entry to understand dictated calls.</div>
+      </div>
 
       <button type="submit" class="btn btn-primary btn-full mt-4">Save Profile &amp; Continue →</button>
     </form>
@@ -1695,6 +1722,38 @@ function autoTipPm(){
   }
 }
 
+/* --- Quick Entry (free-form note → form fields, nothing saved) --- */
+async function parseQuickEntry(){
+  const status=document.getElementById('quickStatus');
+  const text=document.getElementById('quickText').value.trim();
+  if(!text){status.textContent='Type or dictate the call first.';return}
+  const n=new Date(),p=v=>String(v).padStart(2,'0');
+  status.textContent='Reading…';
+  let d;
+  try{
+    const r=await fetch('/api/parse-pickup',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text:text,
+        local_date:n.getFullYear()+'-'+p(n.getMonth()+1)+'-'+p(n.getDate()),
+        local_time:p(n.getHours())+':'+p(n.getMinutes())})});
+    d=await r.json();
+  }catch(err){status.textContent='Network error — check your connection.';return}
+  if(!d||d.error){status.textContent=(d&&d.error)||'No response from the server.';return}
+  resetForm();
+  const f=d.fields||{};
+  Object.keys(f).forEach(k=>{
+    if(!f[k])return;
+    setValue(k, k==='pickup_time'?to12h(f[k]):f[k]);
+  });
+  updateCalcTotal();
+  status.textContent='';
+  showToast('Review the form, then Record Pickup');
+}
+function clearQuickEntry(){
+  document.getElementById('quickText').value='';
+  document.getElementById('quickStatus').textContent='';
+}
+
 async function submitPickup(e){
   e.preventDefault();
   const f=e.target;
@@ -2430,32 +2489,45 @@ _VIEW_MAX     = 3600 * 4     # 4-hour impersonation window
 _RESET_MAX    = 3600         # 1-hour reset tokens
 _reset_tokens: dict[str, str] = {}  # token → user_id
 
-# ── Claude API (shared by /api/ask and /api/debrief) ─────────────
+# ── Claude API (shared by /api/ask, /api/debrief and /api/parse-pickup) ──
 _CLAUDE_MODEL = "claude-sonnet-4-6"
+# Quick Entry needs structured outputs (output_config.format), which
+# claude-sonnet-4-6 does not support.
+_PARSE_MODEL  = "claude-opus-5"
 
 class AskClaudeError(Exception):
     """Claude API call failed; str(exc) is a user-facing message."""
 
-def ask_claude(system: str, user_content: str, max_tokens: int = 1500) -> str:
+def ask_claude(system: str, user_content: str, max_tokens: int = 1500,
+               model: Optional[str] = None, output_schema: Optional[dict] = None,
+               effort: Optional[str] = None) -> str:
     if not _ANTHROPIC_KEY:
         raise AskClaudeError("AI analysis not configured.")
     import anthropic as _anthropic
-    print(f"[claude] {datetime.utcnow().isoformat()} model={_CLAUDE_MODEL} "
+    model = model or _CLAUDE_MODEL
+    print(f"[claude] {datetime.utcnow().isoformat()} model={model} "
           f"input_chars={len(system) + len(user_content)} max_tokens={max_tokens}", flush=True)
     client = _anthropic.Anthropic(api_key=_ANTHROPIC_KEY, timeout=60.0)
+    output_config = {}
+    if output_schema:
+        output_config["format"] = {"type": "json_schema", "schema": output_schema}
+    if effort:
+        output_config["effort"] = effort
+    extra = {"output_config": output_config} if output_config else {}
     try:
         msg = client.messages.create(
-            model=_CLAUDE_MODEL,
+            model=model,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": user_content}],
             system=system,
+            **extra,
         )
     except _anthropic.AuthenticationError:
         raise AskClaudeError("AI request failed: the API key was rejected. Check ANTHROPIC_API_KEY.")
     except _anthropic.PermissionDeniedError:
         raise AskClaudeError("AI request failed: the API key lacks permission for this model.")
     except _anthropic.NotFoundError:
-        raise AskClaudeError(f"AI request failed: model '{_CLAUDE_MODEL}' was not found.")
+        raise AskClaudeError(f"AI request failed: model '{model}' was not found.")
     except _anthropic.RateLimitError as e:
         retry = e.response.headers.get("retry-after") if getattr(e, "response", None) is not None else None
         raise AskClaudeError("AI request failed: rate limit reached. "
@@ -2470,8 +2542,16 @@ def ask_claude(system: str, user_content: str, max_tokens: int = 1500) -> str:
         raise AskClaudeError(f"AI request failed: API error {e.status_code}.")
     if msg.stop_reason == "refusal" or not msg.content:
         raise AskClaudeError("The AI declined to answer this request.")
-    text = msg.content[0].text
+    # Models with thinking on (Opus 5 and later) put a thinking block first, so
+    # take the first text block rather than assuming content[0] is the answer.
+    text = next((b.text for b in msg.content if getattr(b, "type", "text") == "text"), None)
+    if text is None:
+        raise AskClaudeError("The AI returned no answer text. Try again.")
     if msg.stop_reason == "max_tokens":
+        # A truncation notice appended to JSON would break the parse, so callers
+        # expecting a schema get an error instead of half a record.
+        if output_schema:
+            raise AskClaudeError("AI response was cut off before it was complete. Try a shorter note.")
         text += "\n\n(Response cut off — answer exceeded token limit.)"
     return text
 
@@ -3311,7 +3391,8 @@ async def save_profile(request: Request,
                        phone:        str = Form(""),
                        pay_mode:     str = Form("standard"),
                        gate_fee:     str = Form(""),
-                       company_pct:  str = Form("")):
+                       company_pct:  str = Form(""),
+                       places:       str = Form("")):
     ctx = _get_auth_ctx(request)
     if not ctx: return RedirectResponse("/login", status_code=303)
     if ctx.is_impersonating: return RedirectResponse("/", status_code=303)
@@ -3323,6 +3404,7 @@ async def save_profile(request: Request,
         "pay_mode":    pay_mode,
         "gate_fee":    float(gate_fee)    if gate_fee    else None,
         "company_pct": float(company_pct) if company_pct else None,
+        "places":      places.strip(),
     }, driver_id)
     return RedirectResponse("/", status_code=303)
 
@@ -3407,6 +3489,77 @@ async def delete_pickup(pid: str, request: Request):
 async def delete_all(request: Request):
     did = _auth_write(request)
     _write(PICKUPS_F, [], did); _write(CUSTOMERS_F, [], did); return {"ok": True}
+
+# ── Quick Entry: free-form note → unsaved pickup fields ──────────
+
+_PARSE_SCHEMA = {
+    "type": "object",
+    "properties": {f: {"type": "string"} for f in _PICKUP_FIELDS},
+    "required": list(_PICKUP_FIELDS),
+    "additionalProperties": False,
+}
+
+def _parse_system(profile: dict, local_date: str, local_time: str) -> str:
+    places = str((profile or {}).get("places") or "").strip()
+    glossary = ""
+    if places:
+        glossary = f"""
+The driver's shorthand for places they pick up from regularly. Left of "=" is how they
+say it out loud; right of "=" is EXACTLY what you must put in the field:
+{places}
+
+This note may come from speech-to-text, so place names are frequently mangled
+phonetically. Match them against the glossary by sound, not spelling. When a place
+clearly matches a glossary entry, copy that entry's right-hand text verbatim.
+"""
+    return f"""You extract one taxi pickup from a driver's dispatch note. Return only the fields.
+
+The driver's current local date is {local_date or "unknown"} and local time is {local_time or "unknown"}.
+Resolve relative times against that clock. A bare time like "10:00" means the nearest
+upcoming occurrence of that time.
+{glossary}
+Field rules:
+- pickup_date: YYYY-MM-DD. Blank unless the note implies a date.
+- pickup_time: 24-hour HH:MM.
+- street_address: where the passenger is picked up. city: its city, if stated separately.
+- destination_address: where they are going.
+- customer_name, phone_number: the passenger. Format phone as (555) 555-5555.
+- meter_total, tip: digits only, e.g. "24.50". No currency symbol.
+- payment_method, tip_payment_method: exactly "Cash", "Credit", or "Voucher".
+
+Most notes are calls being dispatched, so the fare is not known yet — leave the money
+and payment fields blank unless the note actually states them.
+
+Return "" for every field the note does not state. Never guess, never invent an address,
+a name, or a fare. A blank field is always better than a wrong one."""
+
+@app.post("/api/parse-pickup")
+async def parse_pickup(request: Request):
+    did = _auth_write(request)
+    body = await request.json()
+    text = str(body.get("text") or "").strip()
+    if not text:
+        return {"error": "Nothing to parse — type or dictate the call first."}
+    system = _parse_system(_read_profile(did),
+                           str(body.get("local_date") or "").strip(),
+                           str(body.get("local_time") or "").strip())
+    try:
+        # Low effort: pulling stated fields out of one sentence is trivial, and this
+        # call sits inline in the form flow where the driver is waiting on it.
+        raw = ask_claude(system, text, max_tokens=1024, model=_PARSE_MODEL,
+                         output_schema=_PARSE_SCHEMA, effort="low")
+    except AskClaudeError as e:
+        return {"error": str(e)}
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return {"error": "Couldn't read the AI response — try rephrasing the call."}
+    if not isinstance(data, dict):
+        return {"error": "Couldn't read the AI response — try rephrasing the call."}
+    fields = {k: str(data.get(k) or "").strip() for k in _PICKUP_FIELDS}
+    if not any(fields.values()):
+        return {"error": "Couldn't find pickup details in that — try including a pickup address."}
+    return {"fields": fields}
 
 # ── expenses ─────────────────────────────────────────────────────
 
