@@ -149,3 +149,23 @@ profile glossary is where the vocabulary actually lives.)
 ~45 lines of Python (endpoint + schema + prompt + profile field), ~10 added to `ask_claude`,
 ~20 HTML (Quick Entry panel + Setup textarea), ~25 JS, plus tests. No new dependency, no new
 data file, no changes to the storage layer or `_PICKUP_FIELDS`.
+
+### OPEN — try a cheaper model for Quick Entry (deferred 2026-07-28)
+
+Shipped on `_PARSE_MODEL = "claude-opus-5"` at `effort: "low"`, measured 2.5–3.1s per parse.
+Extraction from one sentence is an easy task, so a smaller model may well do it — worth
+testing once real dictation has proved the feature works at all. **Not before that:** if
+accuracy is being judged, it should be judged on the model that shipped, or a regression
+can't be told apart from the feature never having worked.
+
+- [ ] Candidate: `claude-haiku-4-5` — supports structured outputs (`output_config.format`),
+      which is the constraint that ruled out `claude-sonnet-4-6`. Cheaper and faster.
+- [ ] The hard part is **not** field extraction, it's phonetic glossary matching. Test
+      "chop" / "choke" / "show pea" → the right Chope entry. Also test that a place absent
+      from the glossary passes through untouched rather than being forced onto an entry.
+- [ ] Also check city capitalisation against the known-city list ("san mateo" → "San Mateo",
+      an unseen city → postal capitalisation) and that the list does not leak into
+      `street_address` / `destination_address`. Both were live bugs on Opus 5 during the
+      build; a different model can reintroduce either.
+- [ ] Compare against the Opus 5 baseline on the same notes before switching. `ask_claude`
+      already takes `model`, so the change is the `_PARSE_MODEL` constant and nothing else.
