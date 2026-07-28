@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Known Bugs / Behavior Notes
+
+**Address field bug**: When entering an address, it currently gets inserted into the time field instead of before the street name where it belongs. Do not "fix" this by changing time-field logic unless the user explicitly says to change the time. Only update the address placement logic.
+
 ## How to Work
 
 **Think before coding.** Before writing any code, understand what is actually being asked and why. Identify the minimal change that achieves the goal. If the right approach is unclear, ask rather than guess.
