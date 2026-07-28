@@ -87,6 +87,33 @@ def test_places_glossary_reaches_the_prompt(client, mock_claude):
     # the driver owns the right-hand text; the app must not reshape it
     assert "copy it verbatim" in system
 
+def test_known_cities_reach_the_prompt_most_frequent_first(client, mock_claude):
+    from conftest import CURRENT_PICKUPS
+    seed(pickups=CURRENT_PICKUPS, profile=STANDARD_PROFILE)
+    mock_claude.reply = reply(street_address="1 A St")
+    client.post(URL, json=FULL_NOTE)
+    system = mock_claude.calls[0]["system"]
+    assert "Ann Arbor, Ypsilanti, Saline" in system  # 2, 1, 1
+    assert "Use this list for the city field" in system
+    # the list must not rewrite a place the driver actually named
+    assert "Do not use the list to rename anything" in system
+
+def test_no_pickups_yet_omits_the_city_list(client, mock_claude):
+    """A brand-new driver has no history to match against."""
+    seed(pickups=[], profile=STANDARD_PROFILE)
+    mock_claude.reply = reply(street_address="1 A St")
+    client.post(URL, json=FULL_NOTE)
+    assert "Cities this driver has logged" not in mock_claude.calls[0]["system"]
+
+def test_known_cities_helper_skips_blanks_and_dedupes():
+    rows = [{"city": "San Mateo"}, {"city": "San Mateo"}, {"city": " "},
+            {"city": None}, {}, {"city": "Belmont"}]
+    assert main._known_cities(rows) == ["San Mateo", "Belmont"]
+
+def test_known_cities_helper_caps_the_list():
+    rows = [{"city": f"City {i}"} for i in range(100)]
+    assert len(main._known_cities(rows, limit=40)) == 40
+
 def test_empty_glossary_omits_the_whole_section(client, mock_claude):
     """Most drivers leave this blank — no stray glossary preamble in that case."""
     seed(profile=STANDARD_PROFILE)

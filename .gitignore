@@ -10,3 +10,4 @@ templates/
 backups/
 baseline/
 migrate_sfo.py
+migrate_whitespace.py

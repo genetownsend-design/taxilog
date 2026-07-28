@@ -3504,7 +3504,18 @@ _PARSE_SCHEMA = {
     "additionalProperties": False,
 }
 
-def _parse_system(profile: dict, local_date: str, local_time: str) -> str:
+def _known_cities(pickups: list, limit: int = 40) -> list:
+    """Cities this driver has logged, most frequent first, so a dictated
+    'san mateo' comes back spelled the way the rest of their log spells it."""
+    counts = {}
+    for p in pickups:
+        c = str(p.get("city") or "").strip()
+        if c:
+            counts[c] = counts.get(c, 0) + 1
+    return sorted(counts, key=counts.get, reverse=True)[:limit]
+
+def _parse_system(profile: dict, local_date: str, local_time: str,
+                  cities: list = ()) -> str:
     places = str((profile or {}).get("places") or "").strip()
     glossary = ""
     if places:
@@ -3519,17 +3530,34 @@ Do not expand it, shorten it, or move any part of it into another field:
 This note may come from speech-to-text, so place names are frequently mangled
 phonetically. Match them against the glossary by sound, not spelling.
 """
+    known = ""
+    if cities:
+        known = f"""
+Cities this driver has logged before, most frequent first:
+{", ".join(cities)}
+
+Use this list for the city field: match the spoken city to it by sound and write that
+entry's exact spelling, since dictation lowercases everything — "san mateo" is the city
+spelled "San Mateo" above.
+
+Do not use the list to rename anything. Whatever place the note names is the place that
+goes in the field, so "destination East Palo Alto" gives destination_address
+"East Palo Alto" even though the list abbreviates that city as something else.
+"""
     return f"""You extract one taxi pickup from a driver's dispatch note. Return only the fields.
 
 The driver's current local date is {local_date or "unknown"} and local time is {local_time or "unknown"}.
 Resolve relative times against that clock. A bare time like "10:00" means the nearest
 upcoming occurrence of that time.
-{glossary}
+{glossary}{known}
 Field rules:
 - pickup_date: YYYY-MM-DD. Blank unless the note implies a date.
 - pickup_time: 24-hour HH:MM.
 - street_address: where the passenger is picked up. city: its city, if stated separately.
 - destination_address: where they are going.
+- Dictation arrives all lowercase. Capitalise every place name — street, city and
+  destination alike — the way it would be printed on a sign or a postal address:
+  "burlingame" is "Burlingame", "sfo airport" is "SFO Airport", "12 elm" is "12 Elm".
 - customer_name, phone_number: the passenger. Format phone as (555) 555-5555.
 - meter_total, tip: digits only, e.g. "24.50". No currency symbol.
 - payment_method, tip_payment_method: exactly "Cash", "Credit", or "Voucher".
@@ -3549,7 +3577,8 @@ async def parse_pickup(request: Request):
         return {"error": "Nothing to parse — type or dictate the call first."}
     system = _parse_system(_read_profile(did),
                            str(body.get("local_date") or "").strip(),
-                           str(body.get("local_time") or "").strip())
+                           str(body.get("local_time") or "").strip(),
+                           _known_cities(_read(PICKUPS_F, did)))
     try:
         # Low effort: pulling stated fields out of one sentence is trivial, and this
         # call sits inline in the form flow where the driver is waiting on it.
