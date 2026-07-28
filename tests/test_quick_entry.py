@@ -78,13 +78,14 @@ def test_note_is_the_user_turn_and_schema_is_sent(client, mock_claude):
     assert call["output_schema"]["additionalProperties"] is False
 
 def test_places_glossary_reaches_the_prompt(client, mock_claude):
-    seed(profile=dict(STANDARD_PROFILE,
-                      places="Chope ER = Chope ER, 222 W 39th Ave, San Mateo"))
-    mock_claude.reply = reply(street_address="Chope ER")
+    seed(profile=dict(STANDARD_PROFILE, places="Chope ER = Chope ER 121 W. 4th"))
+    mock_claude.reply = reply(street_address="Chope ER 121 W. 4th")
     client.post(URL, json=FULL_NOTE)
     system = mock_claude.calls[0]["system"]
-    assert "Chope ER = Chope ER, 222 W 39th Ave, San Mateo" in system
+    assert "Chope ER = Chope ER 121 W. 4th" in system
     assert "by sound, not spelling" in system
+    # the driver owns the right-hand text; the app must not reshape it
+    assert "copy it verbatim" in system
 
 def test_empty_glossary_omits_the_whole_section(client, mock_claude):
     """Most drivers leave this blank — no stray glossary preamble in that case."""

@@ -627,8 +627,8 @@ SETUP_HTML = """{% extends "base.html" %}
       <div class="field-group">
         <label class="field-label">Common Places &amp; Shorthand</label>
         <textarea name="places" class="field-input" rows="5"
-                  placeholder="Chope ER = Chope ER, 222 W 39th Ave, San Mateo">{{ profile.places if profile and profile.places else '' }}</textarea>
-        <div class="field-hint">How you say places out loud, and what they should become. One per line. Used by Quick Entry to understand dictated calls.</div>
+                  placeholder="what you say = what goes in the address field">{{ profile.places if profile and profile.places else '' }}</textarea>
+        <div class="field-hint">How you say places out loud, and exactly what should land in the address field. One per line. Used by Quick Entry to understand dictated calls.</div>
       </div>
 
       <button type="submit" class="btn btn-primary btn-full mt-4">Save Profile &amp; Continue →</button>
@@ -3440,13 +3440,18 @@ _PICKUP_FIELDS = ("pickup_date", "pickup_time", "street_address", "city",
                   "customer_name", "phone_number", "destination_address",
                   "meter_total", "payment_method", "tip", "tip_payment_method")
 
+def _trim(v):
+    """Stray whitespace splits 'San Mateo ' from 'San Mateo' everywhere the value
+    is used as a key — reports, groupings, the customer address book."""
+    return v.strip() if isinstance(v, str) else v
+
 @app.post("/api/pickups")
 async def create_pickup(request: Request):
     did = _auth_write(request)
     body = await request.json()
     record = {"id": str(uuid.uuid4())}
     for k in _PICKUP_FIELDS:
-        record[k] = body.get(k, "")
+        record[k] = _trim(body.get(k, ""))
     record["meter_total"]      = _money(record["meter_total"])
     record["tip"]              = _money(record["tip"])
     record["calculated_total"] = calc_total(record["meter_total"], record["tip"])
@@ -3470,7 +3475,7 @@ async def update_pickup(pid: str, request: Request):
     if idx is None: raise HTTPException(404, "Not found")
     rec = pickups[idx]
     for k in _PICKUP_FIELDS:
-        if k in body: rec[k] = body[k]
+        if k in body: rec[k] = _trim(body[k])
     rec["meter_total"]       = _money(rec.get("meter_total"))
     rec["tip"]               = _money(rec.get("tip"))
     rec["calculated_total"]  = calc_total(rec["meter_total"], rec["tip"])
@@ -3504,13 +3509,15 @@ def _parse_system(profile: dict, local_date: str, local_time: str) -> str:
     glossary = ""
     if places:
         glossary = f"""
-The driver's shorthand for places they pick up from regularly. Left of "=" is how they
-say it out loud; right of "=" is EXACTLY what you must put in the field:
+The driver's shorthand for places they pick up from or drop off at regularly. Left of
+"=" is how they say it out loud; right of "=" is exactly the text to put in the address
+field. The driver wrote it that way deliberately, so copy it verbatim — whether that is
+a bare name like "Chope Main" or a name with a street like "Chope Main 121 W. 4th".
+Do not expand it, shorten it, or move any part of it into another field:
 {places}
 
 This note may come from speech-to-text, so place names are frequently mangled
-phonetically. Match them against the glossary by sound, not spelling. When a place
-clearly matches a glossary entry, copy that entry's right-hand text verbatim.
+phonetically. Match them against the glossary by sound, not spelling.
 """
     return f"""You extract one taxi pickup from a driver's dispatch note. Return only the fields.
 
