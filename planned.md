@@ -175,3 +175,37 @@ can't be told apart from the feature never having worked.
       build; a different model can reintroduce either.
 - [ ] Compare against the Opus 5 baseline on the same notes before switching. `ask_claude`
       already takes `model`, so the change is the `_PARSE_MODEL` constant and nothing else.
+
+## OPEN — cover the expensive-to-get-wrong paths with tests (raised 2026-07-28)
+
+Measured 2026-07-28: **10 of 53 routes** have any test. All 10 are pickups, Ask, or
+Debrief — whatever we happened to be building. Untouched: all 10 auth/account routes, all
+18 admin routes, expenses, shifts, daily-totals, customer autocomplete, and every
+report / CSV / PDF / backup path.
+
+The goal is not 100%. Most of that code has been stable for months and a failure in it is
+visible immediately. The goal is the handful of places where a regression is **silent,
+or only discovered when you are already in trouble**. Roughly a day's work, in this order:
+
+- [ ] **Backup / restore round-trip.** `POST /api/restore/all` is what you reach for after
+      a bad day and it has never been executed by a test. Write data → back up → delete →
+      restore → assert byte-identical. Cover the admin variants too
+      (`/api/admin/backup/all`, `/api/admin/restore/all`).
+- [ ] **Auth and impersonation guards.** That `_auth_write` rejects an impersonating admin,
+      that `_require_admin` rejects a driver, and that one driver cannot read another's
+      data. `REFACTOR_PLAN.md` dropped Phase 3 precisely because a single `_auth` /
+      `_auth_write` mix-up could quietly weaken this — and there are no tests holding it.
+      A regression here is invisible until it matters.
+- [ ] **Report math.** Same class of bug as the June Debrief arithmetic errors, and reports
+      are what the money decisions come from. Assert `/api/report` and `/api/daily-totals`
+      against hand-computed fixtures, including each `pay_mode` branch.
+
+Lower priority, failure is loud and immediate: expenses, shifts, PDF generation.
+
+### A gap tests of this shape cannot close
+
+Every mocked test passed while `ask_claude` crashed on a live call, because the mock
+returned `content[0].text` — encoding the same wrong assumption the code did. Mocks
+verify that the code does what was intended; they cannot verify the intention. The
+things that caught the real bugs on 2026-07-28 were live calls against real data. Budget
+for that separately from the suite: it is not a coverage number that fixes it.
