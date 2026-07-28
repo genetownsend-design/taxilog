@@ -159,7 +159,13 @@ accuracy is being judged, it should be judged on the model that shipped, or a re
 can't be told apart from the feature never having worked.
 
 - [ ] Candidate: `claude-haiku-4-5` — supports structured outputs (`output_config.format`),
-      which is the constraint that ruled out `claude-sonnet-4-6`. Cheaper and faster.
+      which is the constraint that ruled out `claude-sonnet-4-6`.
+- [ ] **Cheaper is certain; faster is a guess — measure it.** The 2.5–3.1s is not mostly
+      generation. Network round-trip, processing a system prompt carrying the field rules
+      plus the glossary plus 40 city names, and ~150 tokens of JSON out are fixed costs
+      that do not shrink with model size, so the win may be 3s→2s rather than 3s→0.5s.
+      Discard the first call after any switch: a new schema compiles once, then caches.
+      Note the easy latency is already spent — `effort: "low"` took 5.0s down to 2.7s.
 - [ ] The hard part is **not** field extraction, it's phonetic glossary matching. Test
       "chop" / "choke" / "show pea" → the right Chope entry. Also test that a place absent
       from the glossary passes through untouched rather than being forced onto an entry.
