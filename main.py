@@ -3558,6 +3558,11 @@ Field rules:
 - Dictation arrives all lowercase. Capitalise every place name — street, city and
   destination alike — the way it would be printed on a sign or a postal address:
   "burlingame" is "Burlingame", "sfo airport" is "SFO Airport", "12 elm" is "12 Elm".
+- A number directly before a street name is a street number, never a time. Dictation
+  splits these: "12 30 Laurel" is "1230 Laurel", "5 30 oak" is "530 Oak" — join the
+  digits back together. Read a number as pickup_time only when no street name follows
+  it ("at 10", "10:30", "ten thirty", "at 11am"). A note can hold both, as in
+  "1145 Chestnut at 10": street number first, time after.
 - customer_name, phone_number: the passenger. Format phone as (555) 555-5555.
 - meter_total, tip: digits only, e.g. "24.50". No currency symbol.
 - payment_method, tip_payment_method: exactly "Cash", "Credit", or "Voucher".

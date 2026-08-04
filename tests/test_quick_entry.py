@@ -98,6 +98,16 @@ def test_known_cities_reach_the_prompt_most_frequent_first(client, mock_claude):
     # the list must not rewrite a place the driver actually named
     assert "Do not use the list to rename anything" in system
 
+def test_prompt_disambiguates_street_numbers_from_times(client, mock_claude):
+    """Dictation splits '1230 Laurel' into '12 30 Laurel', which reads as a time and
+    silently eats the street number. Reported from real use 2026-08-04."""
+    seed(profile=STANDARD_PROFILE)
+    mock_claude.reply = reply(street_address="1230 Laurel")
+    client.post(URL, json=FULL_NOTE)
+    system = mock_claude.calls[0]["system"]
+    assert "12 30 Laurel" in system and "1230 Laurel" in system
+    assert "never a time" in system
+
 def test_no_pickups_yet_omits_the_city_list(client, mock_claude):
     """A brand-new driver has no history to match against."""
     seed(pickups=[], profile=STANDARD_PROFILE)
