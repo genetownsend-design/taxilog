@@ -6,7 +6,12 @@
 - [x] Zero out Shift Log fields if the current day's shift has not been saved yet
 - [x] Replace all time input fields with an analogue clock picker — 12-hour face, click hour then minute, AM/PM toggle buttons. Use **Clocklet** (MIT, ~7 kB, vanilla JS, no dependencies): https://github.com/luncheon/clocklet — include via CDN, attach to the pickup time, shift start, and shift end fields.
 
-## Quick Entry — free-form pickup dictation
+## Quick Entry — free-form pickup dictation — SHIPPED 2026-07-28
+
+Live in production since revision `taxilog-00059-fv4`. Commits `005f375`, `506189e`,
+`37b31b2`. The plan below is kept for the reasoning behind each decision; see
+**"What shipped beyond this plan"** at the end of the section for what changed during
+the build.
 
 Type or dictate a sentence ("Pickup at 125 W. 3rd at 10:00, going to Palo Alto"), send it
 to Claude, and fill the existing New Pickup form fields for review. **Nothing is saved** —
@@ -19,7 +24,7 @@ apply.
 
 ### Backend
 
-- [ ] Add `POST /api/parse-pickup` (near `/api/ask`, ~line 3562)
+- [x] Add `POST /api/parse-pickup` (near `/api/ask`, ~line 3562)
   - Guard with `_auth_write` — the feature exists only to create a record, so it should be
     blocked during admin impersonation like every other mutation path.
   - Request body: `{text, local_date, local_time}`. The browser sends its own clock so "at
@@ -27,24 +32,24 @@ apply.
     wrong clock here, and that class of bug already bit us once (commit 4c94853).
   - Response: `{"fields": {…}}` keyed exactly by `_PICKUP_FIELDS`, or `{"error": "…"}`
     following the `/api/ask` convention.
-- [ ] Extract via **structured outputs**, not prose parsing — pass a JSON schema so the
+- [x] Extract via **structured outputs**, not prose parsing — pass a JSON schema so the
       response is guaranteed-parseable instead of "please reply with JSON" plus a regex.
       Schema: all eleven `_PICKUP_FIELDS` as strings, `additionalProperties: false`, all
       listed in `required`, anything not stated in the text returned as `""` and never
       inferred. Empty string rather than `null` matches how the app already stores blank
       fields, so the mapping into the form is a straight copy.
-- [ ] Add `_PARSE_MODEL = "claude-opus-5"` — `_CLAUDE_MODEL` (`claude-sonnet-4-6`) does not
+- [x] Add `_PARSE_MODEL = "claude-opus-5"` — `_CLAUDE_MODEL` (`claude-sonnet-4-6`) does not
       support `output_config.format`. Haiku 4.5 is a reasonable opt-in downgrade later if
       the inline latency proves annoying, but default to Opus 5.
-- [ ] Extend `ask_claude` minimally rather than adding a second Anthropic call site (the
+- [x] Extend `ask_claude` minimally rather than adding a second Anthropic call site (the
       Debrief work established that helper for exactly this reason): add optional `model`
       and `output_schema` params; when a schema is given, pass
       `output_config={"format": {"type": "json_schema", "schema": …}}`.
-- [ ] **Truncation must raise, not append.** `ask_claude` currently appends
+- [x] **Truncation must raise, not append.** `ask_claude` currently appends
       "(Response cut off — answer exceeded token limit.)" on `stop_reason == "max_tokens"`
       (main.py:2474). Appended to JSON that produces invalid JSON. When a schema is in
       play, raise `AskClaudeError` instead.
-- [ ] Prompt contents: the field glossary (mirroring main.py:3629), the driver's local date
+- [x] Prompt contents: the field glossary (mirroring main.py:3629), the driver's local date
       and time, bare times resolve to the nearest upcoming time, payment fields accept only
       Cash/Credit/Voucher, phone numbers keep the app's `(555) 555-5555` shape, and a
       dispatch call typically has no fare yet so money fields stay blank.
@@ -56,27 +61,36 @@ hospital) that speech-to-text will mangle. This is **not** a special case in cod
 per-driver vocabulary field. Every driver has jargon: airport terminals, "the Vet",
 "county", regular bar names.
 
-- [ ] Add a free-text `places` key to `profile.json` — one new field in the
+- [x] Add a free-text `places` key to `profile.json` — one new field in the
       `_write(PROFILE_F, {...})` dict at main.py:3319 and a matching `Form("")` param on
       `POST /setup`. No new storage path, no new file; `_read_profile()` already returns it
       and `/api/ask` already passes the whole profile to Claude (main.py:3647).
-- [ ] Inject that field into the parse prompt as the candidate list, plus the instruction
+- [x] Inject that field into the parse prompt as the candidate list, plus the instruction
       that makes it work: *"This text may come from speech-to-text. Place names are
       frequently mangled phonetically — match them against the glossary by sound, not
       spelling."* Fuzzy phonetic matching against a short known list is reliable; guessing
       blind is not.
-- [ ] Whatever the driver writes on the right of each glossary line is exactly what lands in
+- [x] Whatever the driver writes on the right of each glossary line is exactly what lands in
       the form field — the driver owns the canonical form, not the model. Example content:
 
       ```
-      Chope = Chope Main, 222 W 39th Ave, San Mateo
-      Chope ER = Chope ER, 222 W 39th Ave, San Mateo
-      Chope PES = Chope PES, 222 W 39th Ave, San Mateo
+      Chope = Chope Main
+      Chope ER = Chope ER
+      Chope PES = Chope PES
+      errands and back = Errands and Back
+
       Chope — dictation often renders this as "chop", "choke", "show pea"
       ```
 
       Treat it as a living file: add mis-hearings as they turn up.
-- [ ] **Consequence worth knowing:** `upsert_customer` feeds `street_address` into the
+
+      **Corrected during the build:** the first draft put the full postal address and the
+      city on the right-hand side. Wrong on both counts. `street_address` holds whatever
+      the driver would type there — "121 Wildwood" or just "Chope" — and the city is its
+      own field, so a city inside a glossary entry landed in *both* fields. Entries are
+      bare names now, optionally with a street ("Chope ER 121 W. 4th") if the driver wants
+      it in the log. Either form is copied verbatim; the app never reshapes it.
+- [x] **Consequence worth knowing:** `upsert_customer` feeds `street_address` into the
       address book and `/api/customers/lookup` matches addresses exactly, so distinct
       shorthand values become distinct address-book entries. That's the desired behaviour
       here (Main / ER / PES are operationally different pickups), and it means they also
@@ -87,52 +101,55 @@ per-driver vocabulary field. Every driver has jargon: airport terminals, "the Ve
 
 All in the `main.py` string constants — `templates/` and `static/` are regenerated at startup.
 
-- [ ] Markup before the New Pickup form (~line 344), gated on the existing
+- [x] Markup before the New Pickup form (~line 344), gated on the existing
       `{% if ask_enabled %}` so it disappears when `ANTHROPIC_API_KEY` is absent:
       a "🎙️ Quick Entry" panel with a 2-row textarea, Parse and Clear buttons, and a
       status line.
-- [ ] `parseQuickEntry()` (~line 1688, near `submitPickup`): posts the text plus
+- [x] `parseQuickEntry()` (~line 1688, near `submitPickup`): posts the text plus
       `new Date()` values, then on success calls `resetForm()` and writes each returned
       field. Every form input's `id` already equals its field name, so it's a loop over
       `setValue(k, v)` — with two special cases: `pickup_time` goes through the existing
       `to12h()` before display (the input is the readonly clock-picker showing 12-hour),
       and `updateCalcTotal()` runs at the end. Then a toast: "Review and save."
-- [ ] Full-reset-then-fill rather than merging into whatever is already typed — one
+- [x] Full-reset-then-fill rather than merging into whatever is already typed — one
       sentence in, one predictable form state out.
-- [ ] **No voice library.** Phone keyboards have a dictation button that works in any
+- [x] **No voice library.** Phone keyboards have a dictation button that works in any
       textarea, which is how this gets used in the cab anyway. A Web Speech API mic button
       would add a Chrome-only dependency for something the OS already does free — and see
       the Clocklet lesson about short leashes on third-party JS.
-- [ ] Add a "Common places & shorthand" textarea to the Setup page (`setup.html` constant),
-      hint text: *"How you say places out loud, and what they should become. One per line."*
+- [x] Add a "Common places & shorthand" textarea to the Setup page (`setup.html` constant).
+      Shipped hint: *"How you say places out loud, and exactly what should land in the
+      address field. One per line. Used by Quick Entry to understand dictated calls."*
+      Placeholder is a format hint rather than a sample address — an invented street number
+      in a placeholder reads as real data.
 
 ### Error handling
 
 Every failure mode gets an accurate message, not a generic fallback:
 
-- [ ] Empty/whitespace input → client-side guard, no API call.
-- [ ] API failures → `ask_claude`'s existing branches already cover auth, permission,
+- [x] Empty/whitespace input → client-side guard, no API call.
+- [x] API failures → `ask_claude`'s existing branches already cover auth, permission,
       missing model, rate limit (with retry-after), timeout, connection, and 5xx distinctly.
-- [ ] Truncation → the new raise branch above.
-- [ ] Refusal → existing message.
-- [ ] Malformed JSON → shouldn't occur under a schema, but guard anyway:
+- [x] Truncation → the new raise branch above.
+- [x] Refusal → existing message.
+- [x] Malformed JSON → shouldn't occur under a schema, but guard anyway:
       "Couldn't read the AI response — try rephrasing."
-- [ ] **All fields blank** → its own message, because this is the likeliest real-world
+- [x] **All fields blank** → its own message, because this is the likeliest real-world
       outcome for a garbled dictation: "Couldn't find pickup details in that — try
       including a pickup address."
-- [ ] Network failure on the `fetch` → try/catch. Note `submitAsk()` (main.py:2011) doesn't
+- [x] Network failure on the `fetch` → try/catch. Note `submitAsk()` (main.py:2011) doesn't
       do this today; don't copy that gap.
 
 ### Tests
 
 Follow the `tests/test_debrief.py` precedent — mocked Anthropic client, no network.
 
-- [ ] JSON → field mapping
-- [ ] Blank fields stay blank
-- [ ] `local_date` / `local_time` reach the prompt
-- [ ] Profile `places` glossary reaches the prompt, and is omitted cleanly when empty
-- [ ] Truncation raises rather than returning partial text
-- [ ] Malformed JSON errors rather than half-filling a record
+- [x] JSON → field mapping
+- [x] Blank fields stay blank
+- [x] `local_date` / `local_time` reach the prompt
+- [x] Profile `places` glossary reaches the prompt, and is omitted cleanly when empty
+- [x] Truncation raises rather than returning partial text
+- [x] Malformed JSON errors rather than half-filling a record
 
 ### Out of scope for v1
 
@@ -150,7 +167,32 @@ profile glossary is where the vocabulary actually lives.)
 ~20 HTML (Quick Entry panel + Setup textarea), ~25 JS, plus tests. No new dependency, no new
 data file, no changes to the storage layer or `_PICKUP_FIELDS`.
 
-### OPEN — try a cheaper model for Quick Entry (deferred 2026-07-28)
+### What shipped beyond this plan
+
+Four things the plan did not anticipate, all found by calling the real API rather than by
+running the mocked tests — which passed throughout:
+
+- **`ask_claude` read `msg.content[0].text`.** Opus 5 thinks by default, so `content[0]` is
+  a thinking block and the call raised `AttributeError`. Now takes the first *text* block.
+  This was a latent bug in shipped code: pointing `_CLAUDE_MODEL` at any current model
+  would have broken Ask and Debrief the same way.
+- **`effort: "low"` on the parse call.** 5.0s → ~2.7s with no loss of accuracy, including
+  on the phonetic matching. Extraction from one sentence is easy and the driver is waiting
+  on it.
+- **Whitespace stripped on save** (`_trim` in create/update pickup). Live data had
+  `'San Mateo '` on 86 pickups and `'San Mateo'` on 8 — two different cities to every
+  grouping, report and address-book lookup. Dictation was about to add a third variant.
+  A one-off `migrate_whitespace.py` (gitignored, like `migrate_sfo.py`) normalised 363
+  existing field values across 176 records; revenue verified unchanged at $8,638.36.
+- **Known-city list in the prompt.** Distinct cities from `pickups.json`, most frequent
+  first, so dictated "san mateo" comes back spelled the way the rest of the log spells it.
+  Two live bugs while getting this right, both worth remembering: the list first bled into
+  `destination_address` (saying "East Palo Alto" produced `EPA`, an abbreviation from one
+  old record), and the fix for *that* made destinations transcribe lowercase, recreating
+  the fragmentation the migration had just removed. Scoping the list to the city field and
+  making capitalisation a separate rule fixed both.
+
+## OPEN — try a cheaper model for Quick Entry (deferred 2026-07-28)
 
 Shipped on `_PARSE_MODEL = "claude-opus-5"` at `effort: "low"`, measured 2.5–3.1s per parse.
 Extraction from one sentence is an easy task, so a smaller model may well do it — worth
