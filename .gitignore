@@ -1,5 +1,9 @@
 .env
 .env.deploy
+*.swp
+*.swo
+*.swn
+*~
 __pycache__/
 data/
 static/
