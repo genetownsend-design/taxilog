@@ -268,3 +268,48 @@ def test_no_output_config_when_no_schema(claude_key, monkeypatch):
     main.ask_claude("sys", "hi")
     assert "output_config" not in seen
     assert seen["model"] == main._CLAUDE_MODEL
+
+
+# ── 400s (an exhausted account arrives as one) ───────────────────
+
+import httpx
+
+
+def _raises(exc):
+    def create(**kw):
+        raise exc
+    return SimpleNamespace(messages=SimpleNamespace(create=create))
+
+
+def _bad_request(body):
+    resp = httpx.Response(400, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+    return anthropic.BadRequestError("400", response=resp, body=body)
+
+
+def _err_body(message):
+    return {"type": "error", "error": {"type": "invalid_request_error", "message": message}}
+
+
+def test_out_of_credits_names_billing_not_a_bare_400(claude_key, monkeypatch):
+    """Observed live 2026-08-18: a spent account 400s, and 'API error 400' sends
+    you looking in the code instead of at Plans & Billing."""
+    exc = _bad_request(_err_body("Your credit balance is too low to access the Anthropic API. "
+                                 "Please go to Plans & Billing to upgrade or purchase credits."))
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **kw: _raises(exc))
+    with pytest.raises(main.AskClaudeError) as e:
+        main.ask_claude("sys", "hi")
+    assert "out of credits" in str(e.value)
+    assert "Plans & Billing" in str(e.value)
+
+def test_other_400s_surface_the_api_message(claude_key, monkeypatch):
+    exc = _bad_request(_err_body("max_tokens: must be greater than 0"))
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **kw: _raises(exc))
+    with pytest.raises(main.AskClaudeError) as e:
+        main.ask_claude("sys", "hi")
+    assert "max_tokens: must be greater than 0" in str(e.value)
+
+def test_400_with_no_readable_body_still_reports_400(claude_key, monkeypatch):
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **kw: _raises(_bad_request(None)))
+    with pytest.raises(main.AskClaudeError) as e:
+        main.ask_claude("sys", "hi")
+    assert "rejected (400)" in str(e.value)

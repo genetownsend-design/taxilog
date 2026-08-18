@@ -2522,6 +2522,17 @@ def ask_claude(system: str, user_content: str, max_tokens: int = 1500,
             system=system,
             **extra,
         )
+    except _anthropic.BadRequestError as e:
+        # A spent account comes back as a 400, not a billing-specific status, so the
+        # only way to name the real cause is to read the message.
+        detail = ""
+        if isinstance(getattr(e, "body", None), dict):
+            detail = (e.body.get("error") or {}).get("message", "") or ""
+        if "credit balance" in detail.lower():
+            raise AskClaudeError("AI request failed: the Anthropic account is out of credits. "
+                                 "Add credits in the Anthropic Console under Plans & Billing.")
+        raise AskClaudeError(f"AI request failed: {detail}" if detail
+                             else "AI request failed: the request was rejected (400).")
     except _anthropic.AuthenticationError:
         raise AskClaudeError("AI request failed: the API key was rejected. Check ANTHROPIC_API_KEY.")
     except _anthropic.PermissionDeniedError:
