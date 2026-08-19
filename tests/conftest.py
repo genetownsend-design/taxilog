@@ -63,6 +63,19 @@ def data_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "EXPENSES_F",  tmp_path / "expenses.json")
     monkeypatch.setattr(main, "SHIFTS_F",    tmp_path / "shifts.json")
     monkeypatch.setattr(main, "DEBRIEFS_F",  tmp_path / "debriefs.json")
+
+    # _BACKUP_FILES is built at import time from the constants above, so it keeps
+    # the real data/ paths after the patches. _local() resolves a file as
+    # path.parent/<driver>/path.name, so leaving it alone points /api/backup/all
+    # and /api/restore/all at the developer's live data.
+    monkeypatch.setattr(main, "_BACKUP_FILES", {
+        name: (tmp_path / path.name, expect_list)
+        for name, (path, expect_list) in main._BACKUP_FILES.items()
+    })
+
+    # Fail loudly rather than writing outside the sandbox if that ever breaks.
+    for name, (path, _) in main._BACKUP_FILES.items():
+        assert path.parent == tmp_path, f"_BACKUP_FILES[{name}] escapes tmp_path: {path}"
     return tmp_path
 
 
