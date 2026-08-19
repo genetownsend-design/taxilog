@@ -192,31 +192,54 @@ running the mocked tests — which passed throughout:
   the fragmentation the migration had just removed. Scoping the list to the city field and
   making capitalisation a separate rule fixed both.
 
-## OPEN — try a cheaper model for Quick Entry (deferred 2026-07-28)
+## CLOSED — cheaper model for Quick Entry: tested, staying on Opus 5 (2026-08-18)
 
-Shipped on `_PARSE_MODEL = "claude-opus-5"` at `effort: "low"`, measured 2.5–3.1s per parse.
-Extraction from one sentence is an easy task, so a smaller model may well do it — worth
-testing once real dictation has proved the feature works at all. **Not before that:** if
-accuracy is being judged, it should be judged on the model that shipped, or a regression
-can't be told apart from the feature never having worked.
+Tested `claude-haiku-4-5` against the shipped `claude-opus-5`, both driving the real
+`_parse_system` prompt with the production glossary and city list pulled from GCS. Roughly
+90 live calls, 3 runs per phrasing per model.
 
-- [ ] Candidate: `claude-haiku-4-5` — supports structured outputs (`output_config.format`),
-      which is the constraint that ruled out `claude-sonnet-4-6`.
-- [ ] **Cheaper is certain; faster is a guess — measure it.** The 2.5–3.1s is not mostly
-      generation. Network round-trip, processing a system prompt carrying the field rules
-      plus the glossary plus 40 city names, and ~150 tokens of JSON out are fixed costs
-      that do not shrink with model size, so the win may be 3s→2s rather than 3s→0.5s.
-      Discard the first call after any switch: a new schema compiles once, then caches.
-      Note the easy latency is already spent — `effort: "low"` took 5.0s down to 2.7s.
-- [ ] The hard part is **not** field extraction, it's phonetic glossary matching. Test
-      "chop" / "choke" / "show pea" → the right Chope entry. Also test that a place absent
-      from the glossary passes through untouched rather than being forced onto an entry.
-- [ ] Also check city capitalisation against the known-city list ("san mateo" → "San Mateo",
-      an unseen city → postal capitalisation) and that the list does not leak into
-      `street_address` / `destination_address`. Both were live bugs on Opus 5 during the
-      build; a different model can reintroduce either.
-- [ ] Compare against the Opus 5 baseline on the same notes before switching. `ask_claude`
-      already takes `model`, so the change is the `_PARSE_MODEL` constant and nothing else.
+**Haiku is faster and cheaper than the plan predicted.** Median 1.37s vs 3.63s — a 2.6×
+speedup, not the 3s→2s guessed above. The assumption that fixed costs dominate was wrong.
+Pricing is 5× lower ($1/$5 per MTok vs $5/$25). Phonetic glossary matching, city
+capitalisation, and the known-city list staying out of `street_address` /
+`destination_address` all held up — the risks this plan was most worried about were not
+where it broke.
+
+**It breaks Due Now calls, which is why we're not switching.** Given an address whose digits
+came through split and *no stated time*, Haiku joins the street number correctly and then
+also writes those digits into `pickup_time` — "10 45 chestnut going to belmont" yields
+`1045 Chestnut` **and** `10:45`. Reproduced 3/3 on three separate phrasings; Opus leaves the
+time blank 3/3 on all of them.
+
+That matters because of how the form works, not because of the parse itself. `resetForm()`
+deliberately leaves `pickup_time` alone, so a blank time from the parser means the now+20
+default survives — which is exactly what a Due Now call wants. Haiku's phantom overwrites
+that default with a plausible-looking wrong time (`10:45 AM` reads like an ordinary morning
+pickup) on the most common call type. **State a time and the phantom disappears entirely** —
+Haiku matched Opus exactly on every time-stated phrasing.
+
+**The swap was never a one-constant change.** `effort` is not supported on Haiku 4.5;
+`ask_claude` raises "This model does not support the effort parameter." on every call. A
+switch would also have to drop `effort="low"` — itself a confound, since the Opus baseline
+keeps it. (That message is only legible because of the `BadRequestError` branch in
+`692bae3`; before it, this surfaced as "API error 400.")
+
+Re-open only if parse latency becomes a real complaint. To reproduce: pull `profile.json`
+and `pickups.json` from GCS, build the prompt via `_parse_system`, run both models over the
+same notes, and discard one warm-up call per model so schema-compile time isn't counted.
+
+### Left alone deliberately
+
+- **Bare hours are unreliable on both models.** With the driver's clock at 14:30, "at 7 30"
+  came back `19:30` from Opus (3/3) and `07:30`/`19:30` from Haiku. Real pickups run
+  05:00–17:00 (232 of 236 records), so evening readings are essentially always wrong. Not
+  fixed: Quick Entry fills the form and the driver reviews before saving, so a wrong time is
+  visible and editable, and stating "9am" avoids it. Worth revisiting only if it turns out
+  to be a frequent correction in practice.
+- **"show pea" is ambiguous in the glossary.** Listed as a mis-hearing of bare *Chope*
+  (→ "Chope Main"), but it is phonetically closer to *PES*: Haiku returns `Chope PES` 3/3
+  and Opus flipped on one run of three. If it matters, add an explicit
+  `show pea = Chope Main` line rather than changing models.
 
 ## OPEN — cover the expensive-to-get-wrong paths with tests (raised 2026-07-28)
 
