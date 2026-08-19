@@ -75,3 +75,37 @@ def test_viewed_drivers_password_is_not_accepted_while_impersonating(accounts):
 
 def test_change_password_requires_authentication(data_dir):
     assert change(TestClient(main.app), DRIVER_PW).status_code == 401
+
+
+# ── /admin/reset mints password-reset tokens; it must be admin-only ──
+
+def test_admin_reset_page_is_not_public(accounts):
+    """It listed every driver username to anyone who asked."""
+    r = TestClient(main.app).get("/admin/reset")
+    assert r.status_code == 401
+    assert "test" not in r.text
+
+
+def test_admin_reset_page_rejects_a_plain_driver(accounts):
+    assert signed_in(DRIVER_ID, "driver").get("/admin/reset").status_code == 403
+
+
+def test_anonymous_request_cannot_mint_a_reset_token(accounts):
+    """The whole takeover chain started here: no auth, and the reset URL came
+    back in the response body."""
+    r = TestClient(main.app).post("/admin/reset", data={"username": "test"})
+    assert r.status_code == 401
+    assert "reset-password?token=" not in r.text
+
+
+def test_a_driver_cannot_mint_a_reset_token(accounts):
+    r = signed_in(DRIVER_ID, "driver").post("/admin/reset", data={"username": "boss"})
+    assert r.status_code == 403
+    assert "reset-password?token=" not in r.text
+
+
+def test_admin_can_still_mint_a_reset_token(accounts):
+    """The guard must not break the feature it protects."""
+    r = signed_in(ADMIN_ID, "admin").post("/admin/reset", data={"username": "test"})
+    assert r.status_code == 200
+    assert "reset-password?token=" in r.text

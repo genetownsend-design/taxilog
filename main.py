@@ -2898,11 +2898,13 @@ async def logout():
 
 @app.get("/admin/reset", response_class=HTMLResponse)
 async def admin_reset_get(request: Request):
+    _require_admin(request)
     users = [u for u in _read_users() if u.get("role") != "admin"]
     return _tmpl("admin_reset.html", request, {"error": None, "reset_url": None, "users": users})
 
 @app.post("/admin/reset", response_class=HTMLResponse)
 async def admin_reset_post(request: Request, username: str = Form(...)):
+    _require_admin(request)
     all_users = _read_users()
     driver_list = [u for u in all_users if u.get("role") != "admin"]
     def err(msg):
