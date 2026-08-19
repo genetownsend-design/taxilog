@@ -252,10 +252,27 @@ The goal is not 100%. Most of that code has been stable for months and a failure
 visible immediately. The goal is the handful of places where a regression is **silent,
 or only discovered when you are already in trouble**. Roughly a day's work, in this order:
 
-- [ ] **Backup / restore round-trip.** `POST /api/restore/all` is what you reach for after
-      a bad day and it has never been executed by a test. Write data → back up → delete →
-      restore → assert byte-identical. Cover the admin variants too
-      (`/api/admin/backup/all`, `/api/admin/restore/all`).
+- [x] **Backup / restore round-trip.** Done 2026-08-18 — `tests/test_backup_restore.py`,
+      10 tests. Covers the driver round-trip (seed → back up → wipe → restore → compare),
+      partial zips leaving untouched files alone, the three rejection paths (not a zip,
+      wrong JSON shape, malformed JSON) each asserting nothing was written, auth, the
+      impersonation split (backup allowed, restore 403), and the admin fleet round-trip
+      across two drivers plus `users.json`. Verified by mutation: dropping the shape check,
+      skipping the write, and disabling the impersonation guard each fail the matching test.
+
+      **Setting this up surfaced a live hazard.** `_BACKUP_FILES` is built at import time
+      from the path constants, and `_local()` resolves a file as
+      `path.parent/<driver>/path.name` — so the `data_dir` fixture's monkeypatches did not
+      reach it, and a naive test of `/api/restore/all` writes into the developer's real
+      `data/` directory. `conftest.data_dir` now rebuilds `_BACKUP_FILES` against `tmp_path`
+      and asserts nothing escapes it.
+
+      **Still uncovered: the five per-file pairs** (`/api/backup/pickups`,
+      `/api/restore/pickups`, …). `_register_backup_restore` captures each `Path` in a
+      closure at import, so no fixture can redirect them — testing them means changing
+      `main.py` (making `_local()` resolve against `DATA_DIR`, which is what the constants
+      already mean in production). Left alone rather than reshaping the storage layer for
+      testability without asking; the `/all` endpoints are what a real recovery uses.
 - [ ] **Auth and impersonation guards.** That `_auth_write` rejects an impersonating admin,
       that `_require_admin` rejects a driver, and that one driver cannot read another's
       data. `REFACTOR_PLAN.md` dropped Phase 3 precisely because a single `_auth` /
