@@ -278,6 +278,18 @@ or only discovered when you are already in trouble**. Roughly a day's work, in t
       data. `REFACTOR_PLAN.md` dropped Phase 3 precisely because a single `_auth` /
       `_auth_write` mix-up could quietly weaken this — and there are no tests holding it.
       A regression here is invisible until it matters.
+
+      Started 2026-08-18: `tests/test_auth_guards.py` covers `/api/change-password`, the
+      one mutating endpoint that skips `_auth_write`. That is correct — it acts on
+      `ctx.user_id`, so an impersonating admin changes their own password and must supply
+      their own current one — but it is a single identifier away from letting an admin
+      rewrite a viewed driver's password from inside a read-only view. Pinned in both
+      directions; swapping to `effective_id` fails two tests.
+
+      Still to do: sweep the route table so a *new* endpoint with the wrong guard is caught,
+      rather than spot-checking. Most `/api/` handlers take only `request` and parse the body
+      themselves, so no 422 masks the guard; the exceptions (`file`/`Form` params) need a
+      dummy payload to reach it. Plus cross-driver read isolation.
 - [ ] **Report math.** Same class of bug as the June Debrief arithmetic errors, and reports
       are what the money decisions come from. Assert `/api/report` and `/api/daily-totals`
       against hand-computed fixtures, including each `pay_mode` branch.
