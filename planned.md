@@ -338,3 +338,32 @@ returned `content[0].text` — encoding the same wrong assumption the code did. 
 verify that the code does what was intended; they cannot verify the intention. The
 things that caught the real bugs on 2026-07-28 were live calls against real data. Budget
 for that separately from the suite: it is not a coverage number that fixes it.
+
+## OPEN — self-service password recovery (raised 2026-08-18)
+
+**Discuss the approach before building any of it.** Raised as a want, not a spec.
+
+Today a driver who forgets their password has to ask an admin, who generates a link at
+`/admin/reset`. That is fine at one user and gets tiresome at three. The goal is a driver
+resetting their own password without anyone else being involved — the "email me a reset
+link" shape.
+
+**What makes it more than an afternoon:** no email address is stored for anyone.
+Registration collects username and password only (`POST /register`), and the admin
+bootstrap the same. So this needs an email on the user record, a way to collect it from
+people who already registered without one, and a decision about verifying it at signup —
+an unverified address is a way to send reset links to the wrong person. Sending mail at
+all also means a provider, a secret to hold, and a bounce/failure path. **Explicitly not
+being designed now**; the point of this entry is that it was raised deliberately, not that
+the work is queued.
+
+**Not a lockout risk in the meantime.** If Gene loses his own password, `/admin/register`
+plus `ADMIN_SECRET` (in `.env.deploy`) creates a fresh admin account — under a different
+username, since the existing one is taken — and signs in directly. `/admin/reset` then
+recovers the driver account. Worth knowing offline, since it is needed exactly when you
+cannot log in to look it up.
+
+Note this path narrowed on 2026-08-18: `/admin/reset` had no guard at all, so a locked-out
+admin could have used it unauthenticated. That was an account-takeover hole (`c2966de`) and
+closing it was right, but it did remove an accidental escape hatch — the `ADMIN_SECRET`
+route above is now the only one.
