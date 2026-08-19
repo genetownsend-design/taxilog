@@ -273,23 +273,31 @@ or only discovered when you are already in trouble**. Roughly a day's work, in t
       `main.py` (making `_local()` resolve against `DATA_DIR`, which is what the constants
       already mean in production). Left alone rather than reshaping the storage layer for
       testability without asking; the `/all` endpoints are what a real recovery uses.
-- [ ] **Auth and impersonation guards.** That `_auth_write` rejects an impersonating admin,
-      that `_require_admin` rejects a driver, and that one driver cannot read another's
-      data. `REFACTOR_PLAN.md` dropped Phase 3 precisely because a single `_auth` /
-      `_auth_write` mix-up could quietly weaken this — and there are no tests holding it.
-      A regression here is invisible until it matters.
+- [x] **Auth and impersonation guards.** Done 2026-08-18 — `tests/test_route_guards.py`
+      (the sweep) and `tests/test_auth_guards.py` (the specifics).
 
-      Started 2026-08-18: `tests/test_auth_guards.py` covers `/api/change-password`, the
-      one mutating endpoint that skips `_auth_write`. That is correct — it acts on
-      `ctx.user_id`, so an impersonating admin changes their own password and must supply
-      their own current one — but it is a single identifier away from letting an admin
-      rewrite a viewed driver's password from inside a read-only view. Pinned in both
-      directions; swapping to `effective_id` fails two tests.
+      **It found a live unauthenticated account takeover.** `GET`/`POST /admin/reset` had
+      no guard at all: the page listed every driver username to anyone, the POST minted a
+      password-reset token for any username — admins included, since only the *displayed*
+      list filters them out — and returned the reset URL in the response body. Feeding that
+      to `/reset-password` completed the takeover. Verified end to end against a temp data
+      directory, never against production. Present since `4cf0280` (2026-05-31), roughly
+      eleven weeks on a `--allow-unauthenticated` service. Fixed in `c2966de` by adding the
+      `_require_admin(request)` that every neighbouring admin route already had.
 
-      Still to do: sweep the route table so a *new* endpoint with the wrong guard is caught,
-      rather than spot-checking. Most `/api/` handlers take only `request` and parse the body
-      themselves, so no 422 masks the guard; the exceptions (`file`/`Form` params) need a
-      dummy payload to reach it. Plus cross-driver read isolation.
+      **The sweep is the part worth keeping.** It enumerates `app.routes`, classifies each
+      as public / driver-read / driver-write / admin-only / self-service, and **fails on any
+      route it does not recognise** — so a new endpoint cannot ship without someone deciding
+      its guard. A spot-check suite would never have found `/admin/reset`, because nobody
+      thought to spot-check it. Two details that keep it honest: dummy payloads for the
+      `Form`/`File` endpoints so body validation cannot 422 ahead of the guard, and
+      redirects left unfollowed so a 303 to `/login` reads as the refusal it is.
+
+      Also covered: `/api/change-password` acts on `ctx.user_id`, which is why it correctly
+      skips `_auth_write` — pinned so that switching to `effective_id` (which would let an
+      admin rewrite a viewed driver's password) fails two tests. And cross-driver isolation:
+      listing, fetch-by-id, delete, update, backup contents, and customer autocomplete all
+      stay within one driver. Removing the driver namespace from `_local()` fails all six.
 - [ ] **Report math.** Same class of bug as the June Debrief arithmetic errors, and reports
       are what the money decisions come from. Assert `/api/report` and `/api/daily-totals`
       against hand-computed fixtures, including each `pay_mode` branch.
