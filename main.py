@@ -1787,6 +1787,11 @@ function resetForm(){
   ['street_address','city','customer_name','phone_number','destination_address','meter_total','tip']
     .forEach(id=>setValue(id,''));
   ['payment_method','tip_payment_method'].forEach(id=>setValue(id,''));
+  // Due Now calls lean on this default, so refresh it rather than leaving the
+  // last pickup's time sitting in the field.
+  const d=new Date();d.setMinutes(d.getMinutes()+20);
+  setValue('pickup_time',to12h(String(d.getHours()).padStart(2,'0')+':'
+    +String(d.getMinutes()).padStart(2,'0')));
   updateCalcTotal();clearAC();
 }
 
