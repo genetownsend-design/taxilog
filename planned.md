@@ -298,9 +298,29 @@ or only discovered when you are already in trouble**. Roughly a day's work, in t
       admin rewrite a viewed driver's password) fails two tests. And cross-driver isolation:
       listing, fetch-by-id, delete, update, backup contents, and customer autocomplete all
       stay within one driver. Removing the driver namespace from `_local()` fails all six.
-- [ ] **Report math.** Same class of bug as the June Debrief arithmetic errors, and reports
-      are what the money decisions come from. Assert `/api/report` and `/api/daily-totals`
-      against hand-computed fixtures, including each `pay_mode` branch.
+- [x] **Report math.** Done 2026-08-18 — `tests/test_report_math.py`, 15 tests. All four
+      `pay_mode` branches (standard, gate, commission incl. the 50% default, owner) plus
+      `/api/daily-totals` and `/api/report`: day grouping, inclusive date bounds, expenses,
+      expense-only days surviving into the report, and the `owed_driver` /
+      `driver_earnings` split (what the company owes vs. that plus the cash already in the
+      driver's pocket). Every expected value is worked out by hand in a comment, so a
+      formula change has to disagree with arithmetic rather than with a recorded output.
+
+      The one that would have been expensive: **gate fee is charged per day, not per
+      range.** `/api/report` re-sums the per-day `owed_driver` for gate mode instead of
+      computing across the range — the naive version charges one fee for a whole week and
+      overstates the driver by a day's gate for every extra day. Pinned, and the mutation
+      that removes the re-sum fails it.
+
+      Mutation-checked: removing the per-day gate re-sum, flipping the cash sign in the
+      standard split, and dropping cash-in-hand from `driver_earnings` each fail the
+      matching tests.
+
+      **One question left for Gene, not a change.** Gate mode computes
+      `(meter_credit + meter_voucher)/2 + tips - gate_fee`. A gate lease usually means the
+      driver pays a flat fee and keeps *all* fares, which would be no halving. The tests
+      pin current behaviour rather than guess at the intent — it is inert either way while
+      the profile is on `standard`.
 
 Lower priority, failure is loud and immediate: expenses, shifts, PDF generation.
 
