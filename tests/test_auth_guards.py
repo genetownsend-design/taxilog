@@ -109,3 +109,57 @@ def test_admin_can_still_mint_a_reset_token(accounts):
     r = signed_in(ADMIN_ID, "admin").post("/admin/reset", data={"username": "test"})
     assert r.status_code == 200
     assert "reset-password?token=" in r.text
+
+
+# ── one driver must never reach another driver's data ────────────
+
+OTHER_ID = "other-driver"
+
+MINE = {"id": "mine", "pickup_date": "2026-07-01", "pickup_time": "09:00",
+        "street_address": "1 My St", "city": "Mine", "customer_name": "My Rider",
+        "phone_number": "", "destination_address": "My Dest", "meter_total": 10.0,
+        "payment_method": "Cash", "tip": 0.0, "tip_payment_method": "",
+        "calculated_total": 10.0}
+THEIRS = dict(MINE, id="theirs", street_address="9 Their Ave", city="Theirs",
+              customer_name="Their Rider", destination_address="Their Dest")
+
+
+@pytest.fixture
+def two_drivers(data_dir):
+    main._write(main.PICKUPS_F, [MINE], DRIVER_ID)
+    main._write(main.PICKUPS_F, [THEIRS], OTHER_ID)
+    return signed_in(DRIVER_ID, "driver")
+
+
+def test_listing_returns_only_your_own_pickups(two_drivers):
+    ids = [p["id"] for p in two_drivers.get("/api/pickups").json()]
+    assert ids == ["mine"]
+
+
+def test_another_drivers_pickup_is_not_fetchable_by_id(two_drivers):
+    assert two_drivers.get("/api/pickups/theirs").status_code == 404
+
+
+def test_another_drivers_pickup_cannot_be_deleted(two_drivers):
+    assert two_drivers.delete("/api/pickups/theirs").status_code == 404
+    assert main._read(main.PICKUPS_F, OTHER_ID) == [THEIRS]
+
+
+def test_another_drivers_pickup_cannot_be_overwritten(two_drivers):
+    r = two_drivers.put("/api/pickups/theirs", json=dict(THEIRS, city="Hijacked"))
+    assert r.status_code == 404
+    assert main._read(main.PICKUPS_F, OTHER_ID) == [THEIRS]
+
+
+def test_backup_contains_only_your_own_data(two_drivers):
+    import io, json, zipfile
+    raw = two_drivers.get("/api/backup/all").content
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        assert json.loads(zf.read("pickups.json")) == [MINE]
+
+
+def test_customer_autocomplete_does_not_span_drivers(two_drivers):
+    main._write(main.CUSTOMERS_F, [{"name": "Their Rider", "address": "9 Their Ave",
+                                    "city": "Theirs", "phone": ""}], OTHER_ID)
+    names = [c.get("name") for c in two_drivers.get("/api/customers/suggest?q=their").json()]
+    assert names == []
