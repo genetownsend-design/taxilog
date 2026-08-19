@@ -316,11 +316,18 @@ or only discovered when you are already in trouble**. Roughly a day's work, in t
       standard split, and dropping cash-in-hand from `driver_earnings` each fail the
       matching tests.
 
-      **One question left for Gene, not a change.** Gate mode computes
+      **Gate mode: raised, and deliberately held.** It computes
       `(meter_credit + meter_voucher)/2 + tips - gate_fee`. A gate lease usually means the
-      driver pays a flat fee and keeps *all* fares, which would be no halving. The tests
-      pin current behaviour rather than guess at the intent — it is inert either way while
-      the profile is on `standard`.
+      driver pays a flat fee and keeps *all* fares, which would be no halving — so the `/2`
+      may be standard-mode logic that leaked across.
+
+      **Do not change it on that reasoning alone.** Decided 2026-08-18: gate, commission and
+      owner modes were built for drivers on those plans, none of whom use the app yet; Gene
+      is on `standard`. No real user has ever exercised the gate branch, so there is nothing
+      to check the formula against, and guessing at someone else's pay arrangement is worse
+      than leaving it. Revisit only when a driver on a gate plan can say what their
+      settlement actually looks like. The tests pin current behaviour so any future change
+      is a deliberate one.
 
 Lower priority, failure is loud and immediate: expenses, shifts, PDF generation.
 
