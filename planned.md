@@ -441,6 +441,28 @@ the schema *and* in `required` — Claude will be asked to extract a second tip 
       names.
 - [ ] `test_pickups.py` whitespace trimming covers `tip2_payment_method`.
 
+### Backup and restore — no change, and one trap
+
+Both are schema-agnostic: they zip and unzip the raw JSON and validate only list-vs-object,
+with no field list anywhere. So `tip2` flows through untouched, a backup taken before this
+ships restores cleanly afterwards (a missing `tip2` reads as zero), and
+`tests/test_backup_restore.py` compares whatever was seeded, so it keeps working.
+
+**The trap:** restore writes records verbatim — no `_money()`, no `_trim()`, and no
+`calc_total()` recomputation. It trusts the `calculated_total` already in the file. That is
+harmless today, but once `calculated_total` means `meter + tip + tip2`, the obvious way to
+add second tips to historical records — a script that sets `tip2` and stops — leaves every
+touched record's `calculated_total` stale. Revenue, `grand_total`, the debrief and both
+reports read that stored value rather than recomputing, so the money understates silently.
+
+- [ ] Anything that writes `tip` or `tip2` outside the create/update endpoints must recompute
+      `calculated_total`. That includes one-off scripts, which is exactly where it would be
+      forgotten.
+- [ ] Decide separately, **not as part of this feature**, whether `/api/restore/all` should
+      recompute derived fields instead of trusting the file. That is a change to what restore
+      promises — today it is "put back exactly what you had" — and it deserves its own
+      argument rather than riding along with a tip field.
+
 ### Also goes stale
 
 - [ ] `/api/admin/design-pdf` documents the record schema, the six-bucket accumulation, and
