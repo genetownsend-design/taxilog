@@ -339,6 +339,118 @@ verify that the code does what was intended; they cannot verify the intention. T
 things that caught the real bugs on 2026-07-28 were live calls against real data. Budget
 for that separately from the suite: it is not a coverage number that fixes it.
 
+## PLANNED — second tip entry (2026-08-23)
+
+A fare can carry two tips paid different ways — a card tip plus cash on top. Today there is
+one `tip` and one `tip_payment_method`, so the second one either gets lost or gets recorded
+under the wrong method, which lands it in the wrong bucket and quietly changes what the
+company owes.
+
+Rare enough that the form must not *ask* whether a second tip is needed. Just a second
+optional pair of fields, defaulting to zero and blank, sitting under the first.
+
+### The decision the rest follows from
+
+**Accumulate the second tip into the existing three buckets.** `day_totals` sorts tips into
+`tip_cash` / `tip_credit` / `tip_voucher` by payment method, and `owed_driver_amount` reads
+only those three. If `tip2` is bucketed the same way, **all four pay modes keep working with
+no change at all** — standard, gate, commission and owner never learn a second tip exists.
+
+The alternative — carrying `tip2` separately through the totals — would mean touching every
+pay-mode branch and every consumer of them. Don't.
+
+Same shape one level up: `calculated_total` becomes `meter + tip + tip2`, so revenue,
+`grand_total`, the debrief, and both reports stay correct without knowing why.
+
+### Data
+
+- [ ] `_PICKUP_FIELDS` gains `tip2` and `tip2_payment_method`. Note this feeds
+      `_PARSE_SCHEMA` automatically — see Quick Entry below.
+- [ ] **No migration.** Existing records have no `tip2`; every read is
+      `float(r.get("tip2") or 0)`, and absence already means zero. Unlike
+      `migrate_whitespace.py`, there is nothing to backfill — resist the habit.
+- [ ] `_money()` coercion on `tip2` in create and update, exactly as `tip` gets today.
+
+### Backend
+
+- [ ] `calc_total(meter, tip, tip2=0.0)` — default the third argument so nothing else has to
+      change in the same commit.
+- [ ] `day_totals`: read `tip2` / `tip2_payment_method` and add into the same three buckets.
+      Roughly four lines mirroring the existing tip block.
+- [ ] `owed_driver_amount`: **no change.** If a diff appears here, the bucketing above is
+      wrong — that is the signal to stop, not to patch the branch.
+- [ ] `create_pickup` / `update_pickup`: coerce `tip2`, pass it to `calc_total`.
+- [ ] `_debrief_records`: per-record `tip` is sent to Claude — send the combined tip, or add
+      a second key. Combined is simpler and matches how the debrief talks about money.
+- [ ] `/api/ask` per-pickup rollup builds `"tip": float(p.get("tip") or 0)` — same choice,
+      make it the same way in both places.
+- [ ] `/api/ask` field glossary: document whatever shape the two above settle on. The
+      glossary is what stops the model inventing an interpretation.
+
+### Frontend (all in the `main.py` string constants)
+
+- [ ] Second tip row under the first: `tip2` number input and `tip2_payment_method` select,
+      always visible, defaulting to `0` and blank. No toggle, no "add another tip" button.
+- [ ] `updateCalcTotal` and the edit modal's `eCalc` include `tip2`.
+- [ ] `resetForm`: add `tip2` to the cleared value list and `tip2_payment_method` to the
+      cleared select list.
+- [ ] Edit modal: `e_tip2` / `e_tpm2` alongside `e_tip` / `e_tpm`, and both in the PUT body.
+- [ ] Log card currently renders one tip badge — show the second when non-zero. Also check
+      the `noInfo` condition, which tests `!p.tip` and would call a pickup with only a
+      second tip "No customer info".
+
+### Validation — one real decision
+
+`submitPickup` today: if `tip > 0` and no tip method, it silently falls back to the fare's
+payment method, and only blocks if that is empty too.
+
+- [ ] **Do not copy that fallback for `tip2`.** The entire reason a second tip exists is that
+      it was paid a *different* way, so inheriting a method is more likely wrong than right.
+      Require it explicitly: `tip2 > 0` with no `tip2_payment_method` should block with a
+      message, the way a meter total without a payment method already does.
+
+### Reports and exports
+
+- [ ] CSV gains `tip2` and `tip2_payment_method` columns. This changes the column order of an
+      existing export — decide whether anything downstream reads it positionally.
+- [ ] PDF report row currently prints a single tip figure in a fixed-width column layout.
+      Cheapest correct option is to print the combined tip there and keep the split in CSV;
+      adding a column means re-tuning every width in that table.
+- [ ] Fleet report and admin dashboard read `tip_total`, which already sums the three
+      buckets — correct for free once `day_totals` is right. Worth asserting, not assuming.
+
+### Quick Entry
+
+`_PARSE_SCHEMA` is derived from `_PICKUP_FIELDS`, so adding the fields silently puts them in
+the schema *and* in `required` — Claude will be asked to extract a second tip on every parse.
+
+- [ ] Let that happen rather than decoupling the schema; the existing rule ("leave the money
+      and payment fields blank unless the note actually states them") already covers it, and
+      dispatch calls almost never state a fare, let alone two tips.
+- [ ] Add one line to the field rules naming `tip2` / `tip2_payment_method` so the model
+      knows what they are. Without it, an unexplained required field invites a guess.
+
+### Tests
+
+- [ ] `test_report_math.py`: a pickup with a card tip and a cash tip on the same fare, hand
+      computed through all four pay modes. This is the case the feature exists for and the
+      one that would silently pay the wrong amount.
+- [ ] A record with no `tip2` at all — the back-compat path every existing pickup takes.
+- [ ] `calculated_total` includes both tips on create and on update.
+- [ ] `test_quick_entry.py` asserts on the parse schema's field set; it will need the two new
+      names.
+- [ ] `test_pickups.py` whitespace trimming covers `tip2_payment_method`.
+
+### Also goes stale
+
+- [ ] `/api/admin/design-pdf` documents the record schema, the six-bucket accumulation, and
+      the four pay-mode formulas in prose. It will be wrong the moment this ships.
+
+### Size
+
+~15 lines of Python, ~25 of HTML/JS, ~20 of tests, plus the doc PDF. No new dependency, no
+new data file, no storage-layer change, no migration.
+
 ## OPEN — self-service password recovery (raised 2026-08-18)
 
 **Discuss the approach before building any of it.** Raised as a want, not a spec.
