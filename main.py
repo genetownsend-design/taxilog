@@ -432,6 +432,19 @@ INDEX_HTML = """{% extends "base.html" %}
           </select>
         </div>
       </div>
+      <div class="row-2">
+        <div class="field-group">
+          <label class="field-label">2nd Tip ($)</label>
+          <input type="number" id="tip2" name="tip2" class="field-input"
+                 step="0.01" min="0" placeholder="0.00" oninput="updateCalcTotal()">
+        </div>
+        <div class="field-group">
+          <label class="field-label">2nd Tip Payment</label>
+          <select id="tip2_payment_method" name="tip2_payment_method" class="field-input">
+            <option value="">— Select —</option><option>Cash</option><option>Credit</option><option>Voucher</option>
+          </select>
+        </div>
+      </div>
       <div class="calc-total-bar">
         <span class="calc-total-label">Calculated Total</span>
         <span id="calcTotal" class="calc-total-value">$0.00</span>
@@ -1663,8 +1676,9 @@ document.addEventListener('click',e=>{
 function updateCalcTotal(){
   const m=parseFloat(document.getElementById('meter_total')?.value)||0;
   const t=parseFloat(document.getElementById('tip')?.value)||0;
+  const t2=parseFloat(document.getElementById('tip2')?.value)||0;
   const el=document.getElementById('calcTotal');
-  if(el)el.textContent=fmt(m+t);
+  if(el)el.textContent=fmt(m+t+t2);
 }
 
 /* --- Autocomplete --- */
@@ -1759,10 +1773,16 @@ async function submitPickup(e){
   const f=e.target;
   const meter=parseFloat(f.meter_total.value)||0;
   const tip=parseFloat(f.tip.value)||0;
+  const tip2=parseFloat(f.tip2.value)||0;
   if(meter>0&&!f.payment_method.value){showToast('Please select a Payment method');return;}
   if(tip>0&&!f.tip_payment_method.value){
     if(f.payment_method.value){f.tip_payment_method.value=f.payment_method.value;}
     else{showToast('Please select a Tip Payment method');return;}
+  }
+  // no fallback here on purpose: a second tip exists because it was paid a
+  // different way, so inheriting a method is more likely wrong than right
+  if(tip2>0&&!f.tip2_payment_method.value){
+    showToast('Please select a payment method for the 2nd Tip');return;
   }
   const data={
     pickup_date:f.pickup_date.value,pickup_time:to24h(f.pickup_time.value),
@@ -1771,6 +1791,7 @@ async function submitPickup(e){
     destination_address:f.destination_address.value,
     meter_total:f.meter_total.value,payment_method:f.payment_method.value,
     tip:f.tip.value,tip_payment_method:f.tip_payment_method.value,
+    tip2:f.tip2.value,tip2_payment_method:f.tip2_payment_method.value,
   };
   const r=await fetch('/api/pickups',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
@@ -1784,9 +1805,9 @@ async function submitPickup(e){
 }
 function resetForm(){
   const f=document.getElementById('pickupForm');if(!f)return;
-  ['street_address','city','customer_name','phone_number','destination_address','meter_total','tip']
+  ['street_address','city','customer_name','phone_number','destination_address','meter_total','tip','tip2']
     .forEach(id=>setValue(id,''));
-  ['payment_method','tip_payment_method'].forEach(id=>setValue(id,''));
+  ['payment_method','tip_payment_method','tip2_payment_method'].forEach(id=>setValue(id,''));
   // Due Now calls lean on this default, so refresh it rather than leaving the
   // last pickup's time sitting in the field.
   const d=new Date();d.setMinutes(d.getMinutes()+20);
@@ -1823,9 +1844,10 @@ function renderLog(pickups){
   }
   list.innerHTML=pickups.map(p=>{
     const tipHtml=p.tip>0?'<span class="pickup-meta-item">Tip: '+fmt(p.tip)+' '+pmBadge(p.tip_payment_method)+'</span>':'';
+    const tip2Html=p.tip2>0?'<span class="pickup-meta-item">2nd Tip: '+fmt(p.tip2)+' '+pmBadge(p.tip2_payment_method)+'</span>':'';
     const custHtml=(p.customer_name?'<span class="pickup-meta-item">'+p.customer_name+'</span>':'');
     const phoneHtml=(p.phone_number?'<span class="pickup-meta-item">'+p.phone_number+'</span>':'');
-    const noInfo=(!p.customer_name&&!p.phone_number&&!p.tip)?'<span style="color:var(--text3);font-style:italic">No customer info</span>':'';
+    const noInfo=(!p.customer_name&&!p.phone_number&&!p.tip&&!p.tip2)?'<span style="color:var(--text3);font-style:italic">No customer info</span>':'';
     return'<div class="pickup-card" data-id="'+p.id+'">'
       +'<div class="pickup-card-head">'
         +'<span class="pickup-time">'+(p.pickup_time||'--:--')+'</span>'
@@ -1840,7 +1862,7 @@ function renderLog(pickups){
           +' <span style="color:var(--text3)">→</span> '
           +p.destination_address
         +'</div>'
-        +'<div class="pickup-meta">'+custHtml+phoneHtml+tipHtml+noInfo+'</div>'
+        +'<div class="pickup-meta">'+custHtml+phoneHtml+tipHtml+tip2Html+noInfo+'</div>'
       +'</div>'
       +'<div class="pickup-card-foot">'
         +'<button class="btn btn-sm btn-ghost" data-action="edit" data-id="'+p.id+'">Edit</button>'
@@ -1982,6 +2004,7 @@ async function openEdit(id){
   const body=document.getElementById('editModalBody');
   const pmOpts=['','Cash','Credit','Voucher'].map(v=>'<option'+(p.payment_method===v?' selected':'')+'>'+v+'</option>').join('');
   const tpmOpts=['','Cash','Credit','Voucher'].map(v=>'<option'+(p.tip_payment_method===v?' selected':'')+'>'+v+'</option>').join('');
+  const tpm2Opts=['','Cash','Credit','Voucher'].map(v=>'<option'+(p.tip2_payment_method===v?' selected':'')+'>'+v+'</option>').join('');
   body.innerHTML=
     '<div class="row-2">'
       +'<div class="field-group"><label class="field-label">Date</label><input type="date" id="e_date" class="field-input" value="'+p.pickup_date+'"></div>'
@@ -2002,6 +2025,10 @@ async function openEdit(id){
       +'<div class="field-group"><label class="field-label">Tip ($)</label><input type="number" id="e_tip" class="field-input" step="0.01" value="'+(p.tip||0)+'" oninput="eCalc()"></div>'
       +'<div class="field-group"><label class="field-label">Tip Payment</label><select id="e_tpm" class="field-input">'+tpmOpts+'</select></div>'
     +'</div>'
+    +'<div class="row-2">'
+      +'<div class="field-group"><label class="field-label">2nd Tip ($)</label><input type="number" id="e_tip2" class="field-input" step="0.01" value="'+(p.tip2||0)+'" oninput="eCalc()"></div>'
+      +'<div class="field-group"><label class="field-label">2nd Tip Payment</label><select id="e_tpm2" class="field-input">'+tpm2Opts+'</select></div>'
+    +'</div>'
     +'<div class="calc-total-bar"><span class="calc-total-label">Calculated Total</span><span id="e_calc" class="calc-total-value">'+fmt(p.calculated_total)+'</span></div>'
     +'<div class="btn-group mt-2">'
       +'<button class="btn btn-primary" data-action="save-edit" data-id="'+id+'">Save Changes</button>'
@@ -2012,7 +2039,8 @@ async function openEdit(id){
 function eCalc(){
   const m=parseFloat(document.getElementById('e_meter')?.value)||0;
   const t=parseFloat(document.getElementById('e_tip')?.value)||0;
-  const el=document.getElementById('e_calc');if(el)el.textContent=fmt(m+t);
+  const t2=parseFloat(document.getElementById('e_tip2')?.value)||0;
+  const el=document.getElementById('e_calc');if(el)el.textContent=fmt(m+t+t2);
 }
 document.addEventListener('click',async e=>{
   const btn=e.target.closest('[data-action="save-edit"]');
@@ -2039,6 +2067,8 @@ document.addEventListener('click',async e=>{
     payment_method:document.getElementById('e_pm').value,
     tip:document.getElementById('e_tip').value,
     tip_payment_method:document.getElementById('e_tpm').value,
+    tip2:document.getElementById('e_tip2').value,
+    tip2_payment_method:document.getElementById('e_tpm2').value,
   };
   const r=await fetch('/api/pickups/'+id,{method:'PUT',
     headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
@@ -2756,20 +2786,27 @@ def day_totals(recs, profile=None):
         tpm = (r.get("tip_payment_method") or "").lower()
         m   = float(r.get("meter_total") or 0)
         tip = float(r.get("tip") or 0)
+        # a fare can carry a second tip paid a different way; it lands in the
+        # same three buckets, so owed_driver_amount never has to know
+        tpm2 = (r.get("tip2_payment_method") or "").lower()
+        tip2 = float(r.get("tip2") or 0)
         if   pm  == "cash":    t["meter_cash"]    += m
         elif pm  == "credit":  t["meter_credit"]  += m
         elif pm  == "voucher": t["meter_voucher"]  += m
         if   tpm == "cash":    t["tip_cash"]       += tip
         elif tpm == "credit":  t["tip_credit"]     += tip
         elif tpm == "voucher": t["tip_voucher"]    += tip
+        if   tpm2 == "cash":    t["tip_cash"]      += tip2
+        elif tpm2 == "credit":  t["tip_credit"]    += tip2
+        elif tpm2 == "voucher": t["tip_voucher"]   += tip2
         t["grand_total"] += float(r.get("calculated_total") or 0)
         t["count"] += 1
     result = {k: (round(v, 2) if k != "count" else v) for k, v in t.items()}
     result["owed_driver"] = owed_driver_amount(result, profile)
     return result
 
-def calc_total(meter: float, tip: float) -> float:
-    return round((meter or 0) + (tip or 0), 2)
+def calc_total(meter: float, tip: float, tip2: float = 0.0) -> float:
+    return round((meter or 0) + (tip or 0) + (tip2 or 0), 2)
 
 def _money(v) -> float:
     # request values arrive as '', None, '12.5', or a number — default to 0
@@ -3456,7 +3493,8 @@ async def get_pickups(request: Request, date: Optional[str] = None):
 # create (defaults) and update (copy-if-present) so the list lives once
 _PICKUP_FIELDS = ("pickup_date", "pickup_time", "street_address", "city",
                   "customer_name", "phone_number", "destination_address",
-                  "meter_total", "payment_method", "tip", "tip_payment_method")
+                  "meter_total", "payment_method", "tip", "tip_payment_method",
+                  "tip2", "tip2_payment_method")
 
 def _trim(v):
     """Stray whitespace splits 'San Mateo ' from 'San Mateo' everywhere the value
@@ -3472,7 +3510,8 @@ async def create_pickup(request: Request):
         record[k] = _trim(body.get(k, ""))
     record["meter_total"]      = _money(record["meter_total"])
     record["tip"]              = _money(record["tip"])
-    record["calculated_total"] = calc_total(record["meter_total"], record["tip"])
+    record["tip2"]             = _money(record["tip2"])
+    record["calculated_total"] = calc_total(record["meter_total"], record["tip"], record["tip2"])
     record["created_at"]       = datetime.utcnow().isoformat()
     pickups = _read(PICKUPS_F, did); pickups.append(record); _write(PICKUPS_F, pickups, did)
     upsert_customer(record["customer_name"], record["street_address"], record["city"], record["phone_number"], did)
@@ -3496,7 +3535,8 @@ async def update_pickup(pid: str, request: Request):
         if k in body: rec[k] = _trim(body[k])
     rec["meter_total"]       = _money(rec.get("meter_total"))
     rec["tip"]               = _money(rec.get("tip"))
-    rec["calculated_total"]  = calc_total(rec["meter_total"], rec["tip"])
+    rec["tip2"]              = _money(rec.get("tip2"))
+    rec["calculated_total"]  = calc_total(rec["meter_total"], rec["tip"], rec["tip2"])
     pickups[idx] = rec; _write(PICKUPS_F, pickups, did)
     upsert_customer(rec["customer_name"], rec["street_address"], rec["city"], rec["phone_number"], did)
     return rec
@@ -3584,6 +3624,8 @@ Field rules:
 - customer_name, phone_number: the passenger. Format phone as (555) 555-5555.
 - meter_total, tip: digits only, e.g. "24.50". No currency symbol.
 - payment_method, tip_payment_method: exactly "Cash", "Credit", or "Voucher".
+- tip2, tip2_payment_method: only for a note stating a second tip paid a different way
+  ("twenty on the card and ten cash"). Otherwise both stay blank — this is rare.
 
 Most notes are calls being dispatched, so the fare is not known yet — leave the money
 and payment fields blank unless the note actually states them.
@@ -3842,8 +3884,9 @@ Pickup record field glossary:
 - payment_method: how the FARE (meter amount) was paid — Cash, Credit, or Voucher
 - tip_payment_method: how the TIP was paid — Cash, Credit, or Voucher (may differ from payment_method; may be blank if no tip)
 - tip: tip amount in dollars
+- tip2, tip2_payment_method: an optional second tip on the same fare, paid a different way (a card tip plus cash on top). Usually 0 and blank. When asked about "the tip" on a ride, mean tip + tip2; the pre-verified totals below already combine them
 - meter_total: metered fare amount in dollars
-- calculated_total: total charged (meter + tip)
+- calculated_total: total charged (meter + tip + tip2)
 - pickup_date: date of pickup (YYYY-MM-DD)
 - pickup_time: time of pickup
 - day_of_week: day of the week for the record's date, precomputed by the app — ALWAYS use this field for any day-of-week question; never derive the weekday from a date yourself
@@ -4005,7 +4048,7 @@ def _debrief_records(pickups) -> list:
         "date":           p.get("pickup_date", ""),
         "time":           p.get("pickup_time", ""),
         "fare":           float(p.get("meter_total") or 0),
-        "tip":            float(p.get("tip") or 0),
+        "tip":            round(float(p.get("tip") or 0) + float(p.get("tip2") or 0), 2),
         "payment_method": p.get("payment_method", ""),
     } for p in recent]
 
@@ -4076,14 +4119,16 @@ async def report_csv(request: Request, from_date: str = "", to_date: str = ""):
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["Date","Time","Street Address","City","Customer","Phone",
-                "Destination","Meter","Payment","Tip","Tip Payment","Total"])
+                "Destination","Meter","Payment","Tip","Tip Payment",
+                "2nd Tip","2nd Tip Payment","Total"])
     for p in sorted(pickups, key=lambda x: (x.get("pickup_date",""), x.get("pickup_time",""))):
         w.writerow([p.get("pickup_date",""), p.get("pickup_time",""),
                     p.get("street_address",""), p.get("city",""),
                     p.get("customer_name",""), p.get("phone_number",""),
                     p.get("destination_address",""), p.get("meter_total",0),
                     p.get("payment_method",""), p.get("tip",0),
-                    p.get("tip_payment_method",""), p.get("calculated_total",0)])
+                    p.get("tip_payment_method",""), p.get("tip2",0),
+                    p.get("tip2_payment_method",""), p.get("calculated_total",0)])
     fname = f"taxilog_{from_date or 'all'}_to_{to_date or 'all'}.csv"
     return StreamingResponse(io.BytesIO(buf.getvalue().encode()),
                              media_type="text/csv",
@@ -4172,7 +4217,10 @@ async def report_pdf(request: Request, from_date: str = "", to_date: str = ""):
                 (p.get("destination_address","")[:18]+"…" if len(p.get("destination_address",""))>18 else p.get("destination_address","")),
                 (p.get("customer_name","") or "—")[:14],
                 f"${p.get('meter_total',0):.2f}", p.get("payment_method","—"),
-                f"${p.get('tip',0):.2f}", f"${p.get('calculated_total',0):.2f}",
+                # combined: the table's column widths are fixed, so a second
+                # tip column would mean re-tuning all of them. CSV keeps the split.
+                f"${(float(p.get('tip') or 0) + float(p.get('tip2') or 0)):.2f}",
+                f"${p.get('calculated_total',0):.2f}",
             ])
         tbl = Table(rows, colWidths=col_w)
         tbl.setStyle(TableStyle(hdr_style))
@@ -4646,7 +4694,9 @@ async def admin_design_pdf(request: Request):
             ["payment_method",      "string", "Yes",  "'cash', 'credit', or 'voucher'"],
             ["tip",                 "float",  "No",   "Tip amount (0 if none)"],
             ["tip_payment_method",  "string", "No",   "'cash', 'credit', or 'voucher'"],
-            ["calculated_total",    "float",  "Yes",  "meter_total + tip  (server-computed)"],
+            ["tip2",                "float",  "No",   "Second tip on the same fare, paid a different way (0 if none)"],
+            ["tip2_payment_method", "string", "No",   "'cash', 'credit', or 'voucher'"],
+            ["calculated_total",    "float",  "Yes",  "meter_total + tip + tip2  (server-computed)"],
             ["created_at",          "string", "Yes",  "UTC ISO-8601 datetime"],
         ]),
         sp(6),
@@ -4720,6 +4770,8 @@ async def admin_design_pdf(request: Request):
         Paragraph("tip_cash      += tip  where tip_payment_method == 'cash'", code),
         Paragraph("tip_credit    += tip  where tip_payment_method == 'credit'", code),
         Paragraph("tip_voucher   += tip  where tip_payment_method == 'voucher'", code),
+        Paragraph("tip2 adds into the same three buckets, keyed on tip2_payment_method, "
+                  "so the pay-mode formulas below never see a second tip.", styles["BodyText"]),
         Paragraph("grand_total   += calculated_total  (for every pickup)", code),
         sp(6),
 
@@ -4741,7 +4793,7 @@ async def admin_design_pdf(request: Request):
         sp(6),
 
         Paragraph("7.4  Pickup calculated_total", h3),
-        Paragraph("calculated_total = round(meter_total + tip, 2)  — server-computed on every create/update.", code),
+        Paragraph("calculated_total = round(meter_total + tip + tip2, 2)  — server-computed on every create/update.", code),
         sp(8),
     ]
 

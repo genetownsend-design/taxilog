@@ -85,6 +85,68 @@ def test_missing_profile_is_treated_as_standard():
     assert main.day_totals(ALL, None)["owed_driver"] == main.day_totals(ALL, STANDARD)["owed_driver"]
 
 
+# ── a fare carrying two tips paid different ways ─────────────────
+
+# meter 100 credit, tip 20 credit, second tip 10 cash → total 130
+TWO_TIPS = {"id": "d", "pickup_date": "2026-07-03", "pickup_time": "11:00",
+            "street_address": "4 D", "city": "X", "customer_name": "", "phone_number": "",
+            "destination_address": "", "meter_total": 100.0, "payment_method": "Credit",
+            "tip": 20.0, "tip_payment_method": "Credit",
+            "tip2": 10.0, "tip2_payment_method": "Cash",
+            "calculated_total": 130.0}
+
+
+def test_second_tip_lands_in_the_bucket_for_its_own_payment_method():
+    """The cash tip must not be counted as credit just because the first was."""
+    t = main.day_totals([TWO_TIPS], STANDARD)
+    assert t["tip_credit"] == 20.0
+    assert t["tip_cash"] == 10.0
+    assert t["tip_voucher"] == 0
+    assert t["grand_total"] == 130.0
+
+
+def test_two_tips_standard():
+    """((100 + 0) - 0)/2 + 20 + 0 = 70.00 — the cash tip is already in hand,
+    so it is not money the company owes."""
+    assert main.day_totals([TWO_TIPS], STANDARD)["owed_driver"] == 70.00
+
+
+def test_two_tips_gate():
+    """(100 + 0)/2 + 20 + 0 - 10 = 60.00"""
+    assert main.day_totals([TWO_TIPS], GATE)["owed_driver"] == 60.00
+
+
+def test_two_tips_commission():
+    """Commission counts every tip regardless of method:
+    100 * 0.60 + (10 + 20 + 0) = 60 + 30 = 90.00"""
+    assert main.day_totals([TWO_TIPS], COMMISSION)["owed_driver"] == 90.00
+
+
+def test_two_tips_owner():
+    """grand_total = 130.00"""
+    assert main.day_totals([TWO_TIPS], OWNER)["owed_driver"] == 130.00
+
+
+def test_a_record_with_no_second_tip_field_is_unaffected():
+    """Every pickup logged before the field existed takes this path."""
+    legacy = {k: v for k, v in TWO_TIPS.items()
+              if k not in ("tip2", "tip2_payment_method")}
+    legacy["calculated_total"] = 120.0
+    t = main.day_totals([legacy], STANDARD)
+    assert t["tip_cash"] == 0
+    assert t["tip_credit"] == 20.0
+    assert t["owed_driver"] == 70.00  # unchanged: cash tip never counted here anyway
+
+
+def test_cash_second_tip_reaches_driver_earnings(client):
+    """owed_driver excludes the cash tip; driver_earnings adds it back:
+    70.00 owed + 0 meter_cash + 10.00 tip_cash = 80.00"""
+    seed([TWO_TIPS], STANDARD)
+    t = client.get("/api/daily-totals?date=2026-07-03").json()
+    assert t["owed_driver"] == 70.00
+    assert t["driver_earnings"] == 80.00
+
+
 # ── /api/daily-totals ────────────────────────────────────────────
 
 def test_daily_totals_separates_money_owed_from_money_in_hand(client):

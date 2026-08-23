@@ -60,3 +60,36 @@ def test_non_string_values_pass_through(client):
     seed()
     rec = client.post("/api/pickups", json=dict(PADDED, meter_total=24.5, tip=5)).json()
     assert rec["meter_total"] == 24.5 and rec["tip"] == 5.0
+
+
+# ── second tip ───────────────────────────────────────────────────
+
+def test_create_totals_both_tips(client):
+    """24.50 meter + 5.00 tip + 3.00 second tip = 32.50"""
+    seed()
+    rec = client.post("/api/pickups", json=dict(
+        PADDED, tip2=" 3 ", tip2_payment_method=" Credit")).json()
+    assert rec["tip2"] == 3.0
+    assert rec["tip2_payment_method"] == "Credit"
+    assert rec["calculated_total"] == 32.50
+
+
+def test_update_recomputes_the_total_when_a_second_tip_is_added(client):
+    """Adding the cash tip afterwards has to move calculated_total with it —
+    every report reads the stored value rather than recomputing."""
+    seed()
+    pid = client.post("/api/pickups", json=PADDED).json()["id"]
+    assert main._read(main.PICKUPS_F, DRIVER_ID)[0]["calculated_total"] == 29.50
+
+    rec = client.put(f"/api/pickups/{pid}",
+                     json={"tip2": "3", "tip2_payment_method": "Credit"}).json()
+    assert rec["calculated_total"] == 32.50
+
+
+def test_omitting_the_second_tip_leaves_it_zero(client):
+    """The default path: nearly every pickup never touches these fields."""
+    seed()
+    rec = client.post("/api/pickups", json=PADDED).json()
+    assert rec["tip2"] == 0.0
+    assert rec["tip2_payment_method"] == ""
+    assert rec["calculated_total"] == 29.50
