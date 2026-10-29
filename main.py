@@ -1541,7 +1541,7 @@ function fmt(v){return '$'+(parseFloat(v)||0).toFixed(2)}
 /* 12h ↔ 24h helpers for Clocklet */
 function to24h(t){
   if(!t)return'';
-  const m=t.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  const m=t.match(/^(\\d{1,2}):(\\d{2})\\s*(AM|PM)$/i);
   if(!m)return t;
   let h=parseInt(m[1]);const min=m[2],p=m[3].toUpperCase();
   if(p==='PM'&&h!==12)h+=12;
@@ -1625,7 +1625,7 @@ function to12h(t){
   window.openClockPicker=function(input){
     _inp=input;_mode='hour';
     var v=input.value;
-    var mt=v.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+    var mt=v.match(/^(\\d{1,2}):(\\d{2})\\s*(AM|PM)$/i);
     if(mt){
       _h=parseInt(mt[1]);
       _m=Math.round(parseInt(mt[2])/5)*5%60;
