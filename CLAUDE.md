@@ -23,18 +23,22 @@ python main.py
 
 The app starts on port 8000 by default. No database setup needed — data files are created automatically on first run under `data/`. For local dev, env vars can be put in a `.env` file (loaded via python-dotenv).
 
-Tests (92, Anthropic client mocked throughout — no network):
+Tests (231, Anthropic client mocked throughout — no network):
 
 ```bash
 pip install -r requirements-dev.txt
 python -m pytest tests/
 ```
 
+- `test_route_guards.py` — sweeps all 53 routes and asserts each one's auth guard; a route not classified there fails the sweep, so a new endpoint must be added to it
+- `test_auth_guards.py` — guard behaviour, including impersonation and `/api/change-password` acting on the logged-in account
+- `test_backup_restore.py` — `/api/backup/all`, `/api/restore/all` and the admin variants (not the five per-file endpoints — see the file's docstring)
+- `test_report_math.py` — report and daily-total arithmetic against hand-computed fixtures
 - `test_debrief.py` — stats math, period resolution, caching, the `ask_claude` helper
 - `test_pickups.py` — create/update field handling (whitespace stripping)
 - `test_quick_entry.py` — `/api/parse-pickup` field mapping, prompt contents, error paths
 
-Coverage is deliberately partial: 10 of 53 routes. Auth/admin routes, expenses, shifts, reports, and backup/restore have no tests — see `planned.md` for which of those gaps are worth closing and why. There is no linter configuration and no coverage gate.
+Coverage beyond the guard sweep is deliberately partial: expenses and shifts have no behavioural tests — see `planned.md` for which gaps are worth closing and why. There is no linter configuration and no coverage gate.
 
 Note that mocked tests cannot catch wrong assumptions about the Anthropic API — the whole suite passed while `ask_claude` crashed on every live call, because the mock encoded the same mistake as the code. Live calls against real data are a separate, necessary check.
 
