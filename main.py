@@ -3815,9 +3815,9 @@ def _with_dow(records, date_key):
 
 @app.post("/api/ask")
 async def ask(request: Request):
+    did     = _auth(request)
     if not _ANTHROPIC_KEY:
         raise HTTPException(status_code=503, detail="AI analysis not configured.")
-    did     = _auth(request)
     body    = await request.json()
     question   = str(body.get("question", "")).strip()
     from_date  = str(body.get("from_date", ""))
@@ -4063,10 +4063,10 @@ async def debrief_page(request: Request):
 
 @app.get("/api/debrief")
 async def debrief_api(request: Request, period: str = "day", start: str = "", end: str = "", force: int = 0):
-    if not _ANTHROPIC_KEY:
-        raise HTTPException(status_code=503, detail="AI analysis not configured.")
     ctx = _get_auth_ctx(request)
     if not ctx: raise HTTPException(401, "Not authenticated")
+    if not _ANTHROPIC_KEY:
+        raise HTTPException(status_code=503, detail="AI analysis not configured.")
     did = ctx.effective_id
     s, e, ps, pe = _debrief_range(period, start, end, date.today())
     pickups_all = _read(PICKUPS_F, did)
