@@ -21,7 +21,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-The app starts on port 8080 by default. No database setup needed — data files are created automatically on first run under `data/`. For local dev, env vars can be put in a `.env` file (loaded via python-dotenv).
+The app starts on port 8000 by default. No database setup needed — data files are created automatically on first run under `data/`. For local dev, env vars can be put in a `.env` file (loaded via python-dotenv).
 
 Tests (92, Anthropic client mocked throughout — no network):
 
